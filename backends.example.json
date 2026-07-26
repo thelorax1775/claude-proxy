@@ -1,0 +1,44 @@
+[
+  {
+    "name": "groq",
+    "base_url": "https://api.groq.com/openai/v1",
+    "api_key": "gsk_your_groq_key_here",
+    "big_model": "llama-3.3-70b-versatile",
+    "small_model": "llama-3.1-8b-instant"
+  },
+  {
+    "name": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "api_key": "your_google_ai_studio_key_here",
+    "big_model": "gemini-2.0-flash",
+    "small_model": "gemini-2.0-flash"
+  },
+  {
+    "name": "cerebras",
+    "base_url": "https://api.cerebras.ai/v1",
+    "api_key": "your_cerebras_key_here",
+    "big_model": "llama-3.3-70b",
+    "small_model": "llama3.1-8b"
+  },
+  {
+    "name": "openrouter",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key": "sk-or-your-openrouter-key-here",
+    "big_model": "meta-llama/llama-3.3-70b-instruct:free",
+    "small_model": "meta-llama/llama-3.1-8b-instruct:free"
+  },
+  {
+    "name": "nvidia-nim",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-your_nim_key_here",
+    "big_model": "meta/llama-3.3-70b-instruct",
+    "small_model": "meta/llama-3.1-8b-instruct"
+  },
+  {
+    "name": "local-ollama",
+    "base_url": "http://<ct-102-ip>:11434/v1",
+    "api_key": "",
+    "big_model": "llama3.1:8b",
+    "small_model": "llama3.1:8b"
+  }
+]
