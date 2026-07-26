@@ -5,12 +5,13 @@ translating between Anthropic's Messages API (what Claude Code speaks) and
 any OpenAI-compatible chat completions API -- with automatic failover
 across a list of backends.
 
-**Where this lives:** `C:\Users\Precision-station\nim-claude-proxy\` (a
-plain local git repo, staged but not committed). Everything the project
-needs is in this one folder -- `main.py` plus a handful of config/doc files,
-no external state. If you ever need a different AI/tool to pick this up
-(credits ran out, whatever), point it at this directory and this README;
-there's nothing else to hand over.
+**Where this lives:** `C:\Users\Precision-station\nim-claude-proxy\` and
+pushed to `github.com/thelorax1775/nim-claude-proxy` (private). Everything
+the project needs is in this one folder -- `main.py` plus a handful of
+config/doc files, no external state beyond `backends.json` (gitignored,
+holds real keys, never pushed). If you ever need a different AI/tool to
+pick this up, clone the repo and read this README; there's nothing else to
+hand over.
 
 **What this actually is:** Claude Code stays Claude Code (the CLI/tool-use
 harness). The *model* answering prompts is whichever backend in
@@ -73,14 +74,55 @@ PowerShell:
 ./start.ps1
 ```
 
-Bash:
+Bash (also what the systemd unit below calls):
 ```bash
 chmod +x start.sh
 ./start.sh
 ```
 
-Binds to `127.0.0.1:8082` only (not your LAN/Tailscale network) since this
-proxy holds multiple API keys and has no auth by default.
+Binds to `PROXY_HOST:PROXY_PORT` (default `127.0.0.1:8082`) -- see
+`.env.example`. Stays localhost-only unless you deliberately widen it,
+since this proxy holds multiple API keys and has no auth by default.
+
+## Linux deployment (systemd)
+
+Use this if you want the proxy running as a persistent service on a Linux
+box/LXC instead of a terminal you have to keep open. `deploy/nim-claude-proxy.service`
+is a systemd unit template, in the same style as this homelab's other
+services (e.g. `ollama.service` on ai-audit).
+
+```bash
+# 1. Get the code onto the box and set up a venv
+sudo git clone https://github.com/thelorax1775/nim-claude-proxy /opt/nim-claude-proxy
+cd /opt/nim-claude-proxy
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+
+# 2. Config (both gitignored, never committed)
+cp .env.example .env
+cp backends.example.json backends.json
+# edit both: real backend keys/URLs in backends.json; PROXY_HOST/PORT and
+# PROXY_SHARED_KEY in .env -- if Claude Code runs on a DIFFERENT machine
+# than this box, set PROXY_HOST to 0.0.0.0 (or this box's Tailscale IP) and
+# set PROXY_SHARED_KEY, since anything beyond 127.0.0.1 has no auth otherwise
+
+# 3. Dedicated unprivileged user (matches the unit's User=/Group=)
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin nim-claude-proxy
+sudo chown -R nim-claude-proxy:nim-claude-proxy /opt/nim-claude-proxy
+
+# 4. Install and start the service
+sudo cp deploy/nim-claude-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nim-claude-proxy
+sudo systemctl status nim-claude-proxy
+```
+
+Then point `ANTHROPIC_BASE_URL` at wherever this box is reachable, e.g.
+`http://<its-tailscale-ip>:8082`, from whatever machine runs `claude`.
+
+Logs: `journalctl -u nim-claude-proxy -f`. Config changes need
+`sudo systemctl restart nim-claude-proxy` to take effect (`.env` and
+`backends.json` are both read at process startup, not live-reloaded).
 
 Check it's alive:
 ```bash

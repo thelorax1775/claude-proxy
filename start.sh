@@ -1,4 +1,14 @@
 #!/bin/bash
 set -euo pipefail
-export $(grep -v '^#' .env | grep -v '^\s*$' | xargs)
-uvicorn main:app --host 127.0.0.1 --port 8082
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
+HOST="${PROXY_HOST:-127.0.0.1}"
+PORT="${PROXY_PORT:-8082}"
+
+exec uvicorn main:app --host "$HOST" --port "$PORT"

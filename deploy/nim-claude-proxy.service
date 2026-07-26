@@ -1,0 +1,25 @@
+[Unit]
+Description=nim-claude-proxy (Anthropic Messages <-> OpenAI-compatible proxy for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nim-claude-proxy
+Group=nim-claude-proxy
+WorkingDirectory=/opt/nim-claude-proxy
+EnvironmentFile=/opt/nim-claude-proxy/.env
+ExecStart=/opt/nim-claude-proxy/.venv/bin/uvicorn main:app --host ${PROXY_HOST} --port ${PROXY_PORT}
+Restart=always
+RestartSec=3
+
+# Basic hardening -- this process holds API keys and has no auth by default
+# beyond PROXY_SHARED_KEY, so keep its blast radius small.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/nim-claude-proxy
+
+[Install]
+WantedBy=multi-user.target
