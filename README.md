@@ -5,19 +5,30 @@ translating between Anthropic's Messages API (what Claude Code speaks) and
 any OpenAI-compatible chat completions API -- with automatic failover
 across a list of backends.
 
-**Where this lives:** `C:\Users\Precision-station\claude-proxy\` and
-pushed to `github.com/thelorax1775/claude-proxy` (private). Everything
-the project needs is in this one folder -- `main.py` plus a handful of
-config/doc files, no external state beyond `backends.json` (gitignored,
-holds real keys, never pushed). If you ever need a different AI/tool to
-pick this up, clone the repo and read this README; there's nothing else to
-hand over.
+Everything the project needs is in this one repo -- `main.py` plus a
+handful of config/doc files. All state that's specific to your setup
+(API keys, which backends you use) lives in `backends.json`, which you
+create locally and which is gitignored -- it never gets committed, so
+cloning this repo is safe to do publicly.
 
 **What this actually is:** Claude Code stays Claude Code (the CLI/tool-use
 harness). The *model* answering prompts is whichever backend in
 `backends.json` actually responds. You are not getting Anthropic's Claude
 models for free; you're using Claude Code as a CLI frontend for other
 models.
+
+## Prerequisites
+
+- [Claude Code](https://github.com/anthropics/claude-code) installed (`npm install -g @anthropic-ai/claude-code`)
+- Python 3.10+
+- At least one place for requests to actually go: an account with a free-tier
+  OpenAI-compatible API (Groq, Google AI Studio, Cerebras, OpenRouter,
+  NVIDIA NIM -- see below), and/or your own running Ollama instance
+
+```bash
+git clone https://github.com/thelorax1775/claude-proxy
+cd claude-proxy
+```
 
 ## How the failover works
 
@@ -53,10 +64,12 @@ Where to get each free key:
 - **Cerebras** -- cloud.cerebras.ai -> API Keys. Free tier.
 - **OpenRouter** -- openrouter.ai/keys. The `:free` suffixed models cost nothing (rate-limited).
 - **NVIDIA NIM** -- build.nvidia.com -> API Keys. Free trial credits, not unlimited.
-- **Local Ollama (a container on your LAN)** -- no key needed, replace
-  `<ct-102-ip>` in `backends.json` with its real IP, and make sure the model
-  tag you list is actually pulled (`ollama pull llama3.1:8b`) and supports
-  tool calling.
+- **Local Ollama** -- if you're running Ollama yourself, no key needed.
+  Point `base_url` at wherever it's reachable (e.g. `http://localhost:11434/v1`
+  for raw Ollama, or through a gateway like Open WebUI's own API if you've
+  locked Ollama down to localhost -- see "A note on Open WebUI" below). Make
+  sure the model tag you list is actually pulled (`ollama pull llama3.1:8b`)
+  and supports tool calling.
 
 Model IDs in `backends.example.json` were current as of this proxy's
 build date -- providers rename/rev models. If a backend keeps failing,
@@ -66,6 +79,18 @@ else is broken.
 You don't need every provider filled in -- fewer entries just means a
 shorter failover chain. Just keep Ollama as the last entry so there's
 always a final backend that can't run out.
+
+### A note on Open WebUI
+
+If Ollama is only reachable through Open WebUI (e.g. you've deliberately
+bound Ollama to `127.0.0.1` and Open WebUI is the only exposed gateway),
+point `base_url` at Open WebUI instead: `http://<host>:8080/api`, with an
+`Authorization: Bearer <key>` generated in Open WebUI's Settings > Account >
+API Keys. Its OpenAI-compatible route is `POST /api/chat/completions`, not
+`/v1/chat/completions` -- that path just serves Open WebUI's own frontend
+on most versions. This proxy's default `{base_url}/chat/completions` URL
+construction handles both cases correctly as long as `base_url` includes
+whichever prefix (`/api` or nothing) your setup actually needs.
 
 ## Run the proxy
 
@@ -87,9 +112,8 @@ since this proxy holds multiple API keys and has no auth by default.
 ## Linux deployment (systemd)
 
 Use this if you want the proxy running as a persistent service on a Linux
-box/LXC instead of a terminal you have to keep open. `deploy/claude-proxy.service`
-is a systemd unit template, in the same style as this homelab's other
-services (e.g. `ollama.service` on ai-audit).
+box/VM/LXC instead of a terminal you have to keep open. `deploy/claude-proxy.service`
+is a systemd unit template you can adapt.
 
 ```bash
 # 1. Get the code onto the box and set up a venv
