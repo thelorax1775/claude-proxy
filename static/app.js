@@ -6,6 +6,12 @@ const PRESETS = [
   { label: "NVIDIA NIM", base_url: "https://integrate.api.nvidia.com/v1", big: "meta/llama-3.3-70b-instruct", small: "meta/llama-3.1-8b-instruct" },
   { label: "Local Ollama", base_url: "http://localhost:11434/v1", big: "llama3.1:8b", small: "llama3.1:8b" },
   { label: "Open WebUI gateway", base_url: "http://localhost:8080/api", big: "", small: "" },
+  {
+    label: "Ollama Cloud",
+    base_url: "https://ollama.com/v1",
+    big: "", small: "",
+    note: "Best-known guess -- verify the exact base URL and grab a key at ollama.com/settings/keys, then confirm with “Detect models” below before trusting it.",
+  },
   { label: "Custom", base_url: "", big: "", small: "" },
 ];
 
@@ -37,6 +43,7 @@ function fillPresets() {
     $("f-big-model").value = p.big;
     $("f-small-model").value = p.small;
     if (!$("f-name").value) $("f-name").value = p.label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+    $("preset-note").textContent = p.note || "";
   };
   sel.onchange();
 }
