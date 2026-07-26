@@ -175,6 +175,14 @@ function appendBubble(role, text) {
   return div;
 }
 
+function insertSystemNotice(beforeEl, text) {
+  const div = document.createElement("div");
+  div.className = "bubble system";
+  div.textContent = text;
+  beforeEl.parentNode.insertBefore(div, beforeEl);
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
 $("clear-btn").onclick = () => {
   history = [];
   $("messages").innerHTML = `<div class="empty-state">Add a backend on the left, pick it above, and start chatting.</div>`;
@@ -238,6 +246,14 @@ async function sendMessage() {
         if (data === "[DONE]") continue;
         try {
           const chunk = JSON.parse(data);
+          if (chunk.claude_proxy_switch) {
+            insertSystemNotice(assistantBubble,
+              `Switched to "${chunk.claude_proxy_switch}" (${chunk.claude_proxy_model}) after the previous backend ran out.`);
+            $("chat-backend").value = chunk.claude_proxy_switch;
+            renderModelSelector();
+            $("chat-model").value = chunk.claude_proxy_model;
+            continue;
+          }
           if (chunk.error) {
             full += `\n[error] ${chunk.error}`;
             assistantBubble.textContent = full;

@@ -580,48 +580,98 @@ async def probe_models(request: Request):
     return {"models": sorted(set(ids))}
 
 
+def chat_fallback_chain(start_name: str, start_model: str):
+    """Selected backend/model first, then every other configured backend
+    (each using its own big_model) in their configured order -- so exhausting
+    the chosen account transparently falls through the rest of the chain
+    instead of dead-ending the conversation."""
+    selected = next((b for b in BACKENDS if b["name"] == start_name), None)
+    if selected is None:
+        return None
+    chain = [(selected, start_model or selected.get("big_model"))]
+    chain += [(b, b.get("big_model")) for b in BACKENDS if b["name"] != start_name]
+    return chain
+
+
 @app.post("/api/chat", dependencies=[Depends(require_proxy_key)])
 async def ui_chat(request: Request):
-    """Direct passthrough for the manual test-chat UI: talks to exactly the
-    backend/model the user picked, no failover, no Anthropic translation --
-    this is a human testing a provider, not Claude Code driving one."""
+    """Manual test-chat UI. Starts with the backend/model the user picked;
+    on 429/401/403/5xx/connection error, transparently falls through the
+    rest of the configured backends (same conversation history) rather than
+    erroring out -- this is what lets one account's quota running out just
+    move to the next account instead of interrupting the chat."""
     body = await request.json()
-    backend_name = body.get("backend")
-    backend = next((b for b in BACKENDS if b["name"] == backend_name), None)
-    if backend is None:
-        raise HTTPException(status_code=404, detail=f"backend '{backend_name}' not found")
+    chain = chat_fallback_chain(body.get("backend"), body.get("model"))
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"backend '{body.get('backend')}' not found")
 
-    payload = {
-        "model": body.get("model") or backend.get("big_model"),
-        "messages": body.get("messages", []),
-        "stream": bool(body.get("stream", True)),
-    }
-    url = f"{backend['base_url']}/chat/completions"
-    headers = backend_headers(backend)
+    messages = body.get("messages", [])
+    stream = bool(body.get("stream", True))
+    started_on = chain[0][0]["name"]
 
-    if payload["stream"]:
+    if stream:
         client = httpx.AsyncClient()
 
         async def gen():
             try:
-                async with client.stream("POST", url, headers=headers, json=payload,
-                                          timeout=HTTP_TIMEOUT) as resp:
+                for backend, model in chain:
+                    payload = {"model": model, "messages": messages, "stream": True}
+                    url = f"{backend['base_url']}/chat/completions"
+                    req = client.build_request("POST", url, headers=backend_headers(backend),
+                                                json=payload, timeout=HTTP_TIMEOUT)
+                    try:
+                        resp = await client.send(req, stream=True)
+                    except httpx.HTTPError as e:
+                        record_attempt(backend["name"], f"connection error: {e}")
+                        continue
+                    if resp.status_code in RETRYABLE_STATUS:
+                        await resp.aclose()
+                        record_attempt(backend["name"], f"HTTP {resp.status_code}")
+                        continue
                     if resp.status_code >= 400:
                         err = (await resp.aread()).decode("utf-8", "replace")
+                        await resp.aclose()
                         yield f"data: {json.dumps({'error': err})}\n\n"
                         return
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                    record_attempt(backend["name"], "ok")
+                    if backend["name"] != started_on:
+                        yield f"data: {json.dumps({'claude_proxy_switch': backend['name'], 'claude_proxy_model': model})}\n\n"
+                    try:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
+                    finally:
+                        await resp.aclose()
+                    return
+                yield f"data: {json.dumps({'error': 'all configured backends exhausted'})}\n\n"
             finally:
                 await client.aclose()
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        if resp.status_code >= 400:
-            return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
-        return JSONResponse(content=resp.json())
+        last_error = None
+        for backend, model in chain:
+            payload = {"model": model, "messages": messages, "stream": False}
+            url = f"{backend['base_url']}/chat/completions"
+            try:
+                resp = await client.post(url, headers=backend_headers(backend), json=payload)
+            except httpx.HTTPError as e:
+                record_attempt(backend["name"], f"connection error: {e}")
+                last_error = str(e)
+                continue
+            if resp.status_code in RETRYABLE_STATUS:
+                record_attempt(backend["name"], f"HTTP {resp.status_code}")
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            if resp.status_code >= 400:
+                return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+            record_attempt(backend["name"], "ok")
+            data = resp.json()
+            if backend["name"] != started_on:
+                data["claude_proxy_switch"] = backend["name"]
+                data["claude_proxy_model"] = model
+            return JSONResponse(content=data)
+        raise HTTPException(status_code=502, detail=f"all configured backends exhausted: {last_error}")
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

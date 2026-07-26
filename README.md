@@ -28,11 +28,13 @@ bound it) in a browser for:
   remove backends with the arrows/× on each card. This edits `backends.json`
   for you -- no need to hand-edit JSON or paste keys into a chat transcript.
 - **A test chat** -- pick any configured backend + model from the dropdowns
-  and talk to it directly, with streaming responses. This talks straight to
-  the backend you pick (no failover, no Anthropic translation) -- it's for
-  manually verifying a provider/model works before trusting it in the
-  failover chain, separate from how Claude Code itself uses the proxy via
-  `/v1/messages`.
+  and talk to it directly, with streaming responses (no Anthropic
+  translation -- this is a human talking to a provider, separate from how
+  Claude Code uses the proxy via `/v1/messages`). If that backend gets
+  rate-limited or its key dies mid-conversation, the chat transparently
+  falls through the rest of your configured backends (same conversation
+  history, no error shown) and a small system note announces the switch --
+  the dropdowns update to match, so your next message starts there directly.
 
 Everything here runs API keys through this local server only -- keys never
 leave the machine the proxy runs on except to reach the provider you picked.
