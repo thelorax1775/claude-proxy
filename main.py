@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger("nim-claude-proxy")
+log = logging.getLogger("claude-proxy")
 
 # Last 50 backend attempts, newest last -- see GET /status
 ATTEMPT_LOG = collections.deque(maxlen=50)

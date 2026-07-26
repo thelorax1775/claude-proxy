@@ -1,12 +1,12 @@
-# nim-claude-proxy
+# claude-proxy
 
 Runs Claude Code against a model of your choosing instead of Anthropic, by
 translating between Anthropic's Messages API (what Claude Code speaks) and
 any OpenAI-compatible chat completions API -- with automatic failover
 across a list of backends.
 
-**Where this lives:** `C:\Users\Precision-station\nim-claude-proxy\` and
-pushed to `github.com/thelorax1775/nim-claude-proxy` (private). Everything
+**Where this lives:** `C:\Users\Precision-station\claude-proxy\` and
+pushed to `github.com/thelorax1775/claude-proxy` (private). Everything
 the project needs is in this one folder -- `main.py` plus a handful of
 config/doc files, no external state beyond `backends.json` (gitignored,
 holds real keys, never pushed). If you ever need a different AI/tool to
@@ -87,14 +87,14 @@ since this proxy holds multiple API keys and has no auth by default.
 ## Linux deployment (systemd)
 
 Use this if you want the proxy running as a persistent service on a Linux
-box/LXC instead of a terminal you have to keep open. `deploy/nim-claude-proxy.service`
+box/LXC instead of a terminal you have to keep open. `deploy/claude-proxy.service`
 is a systemd unit template, in the same style as this homelab's other
 services (e.g. `ollama.service` on ai-audit).
 
 ```bash
 # 1. Get the code onto the box and set up a venv
-sudo git clone https://github.com/thelorax1775/nim-claude-proxy /opt/nim-claude-proxy
-cd /opt/nim-claude-proxy
+sudo git clone https://github.com/thelorax1775/claude-proxy /opt/claude-proxy
+cd /opt/claude-proxy
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
@@ -107,21 +107,21 @@ cp backends.example.json backends.json
 # set PROXY_SHARED_KEY, since anything beyond 127.0.0.1 has no auth otherwise
 
 # 3. Dedicated unprivileged user (matches the unit's User=/Group=)
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin nim-claude-proxy
-sudo chown -R nim-claude-proxy:nim-claude-proxy /opt/nim-claude-proxy
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin claude-proxy
+sudo chown -R claude-proxy:claude-proxy /opt/claude-proxy
 
 # 4. Install and start the service
-sudo cp deploy/nim-claude-proxy.service /etc/systemd/system/
+sudo cp deploy/claude-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now nim-claude-proxy
-sudo systemctl status nim-claude-proxy
+sudo systemctl enable --now claude-proxy
+sudo systemctl status claude-proxy
 ```
 
 Then point `ANTHROPIC_BASE_URL` at wherever this box is reachable, e.g.
 `http://<its-tailscale-ip>:8082`, from whatever machine runs `claude`.
 
-Logs: `journalctl -u nim-claude-proxy -f`. Config changes need
-`sudo systemctl restart nim-claude-proxy` to take effect (`.env` and
+Logs: `journalctl -u claude-proxy -f`. Config changes need
+`sudo systemctl restart claude-proxy` to take effect (`.env` and
 `backends.json` are both read at process startup, not live-reloaded).
 
 Check it's alive:
@@ -136,14 +136,14 @@ In the terminal you'll run `claude` from:
 PowerShell:
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8082"
-$env:ANTHROPIC_API_KEY = "local-nim-proxy"   # any non-empty placeholder
+$env:ANTHROPIC_API_KEY = "local-claude-proxy"   # any non-empty placeholder
 claude
 ```
 
 Bash:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
-export ANTHROPIC_API_KEY=local-nim-proxy
+export ANTHROPIC_API_KEY=local-claude-proxy
 claude
 ```
 
@@ -152,7 +152,7 @@ claude
 ```bash
 curl -N -X POST http://127.0.0.1:8082/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: local-nim-proxy" \
+  -H "x-api-key: local-claude-proxy" \
   -d '{
     "model": "claude-3-5-sonnet-latest",
     "max_tokens": 512,
