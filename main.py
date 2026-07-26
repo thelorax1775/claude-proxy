@@ -16,7 +16,7 @@ import time
 import uuid
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -88,6 +88,17 @@ def check_auth(x_api_key: str | None, authorization: str | None):
     token = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
     if token != PROXY_SHARED_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+async def require_proxy_key(x_proxy_key: str | None = Header(default=None, alias="X-Proxy-Key")):
+    """Gates the web UI's /api/* routes. Separate from check_auth (which
+    gates Claude Code's /v1/messages) because the browser can't send
+    Anthropic-style headers -- same PROXY_SHARED_KEY value, different header.
+    A no-op when PROXY_SHARED_KEY isn't set (e.g. localhost-only deployments)."""
+    if not PROXY_SHARED_KEY:
+        return
+    if x_proxy_key != PROXY_SHARED_KEY:
+        raise HTTPException(status_code=401, detail="invalid proxy key")
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +475,12 @@ def public_backend(b: dict) -> dict:
     }
 
 
-@app.get("/api/backends")
+@app.get("/api/backends", dependencies=[Depends(require_proxy_key)])
 async def list_backends():
     return {"backends": [public_backend(b) for b in BACKENDS]}
 
 
-@app.post("/api/backends")
+@app.post("/api/backends", dependencies=[Depends(require_proxy_key)])
 async def add_backend(request: Request):
     body = await request.json()
     name = (body.get("name") or "").strip()
@@ -492,7 +503,7 @@ async def add_backend(request: Request):
     return public_backend(entry)
 
 
-@app.patch("/api/backends/{name}")
+@app.patch("/api/backends/{name}", dependencies=[Depends(require_proxy_key)])
 async def update_backend(name: str, request: Request):
     body = await request.json()
     for b in BACKENDS:
@@ -505,7 +516,7 @@ async def update_backend(name: str, request: Request):
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
 
 
-@app.delete("/api/backends/{name}")
+@app.delete("/api/backends/{name}", dependencies=[Depends(require_proxy_key)])
 async def delete_backend(name: str):
     for i, b in enumerate(BACKENDS):
         if b["name"] == name:
@@ -515,7 +526,7 @@ async def delete_backend(name: str):
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
 
 
-@app.post("/api/backends/reorder")
+@app.post("/api/backends/reorder", dependencies=[Depends(require_proxy_key)])
 async def reorder_backends(request: Request):
     body = await request.json()
     order = body.get("order") or []
@@ -527,7 +538,7 @@ async def reorder_backends(request: Request):
     return {"backends": [public_backend(b) for b in BACKENDS]}
 
 
-@app.post("/api/probe-models")
+@app.post("/api/probe-models", dependencies=[Depends(require_proxy_key)])
 async def probe_models(request: Request):
     """Best-effort model discovery for the add-backend form. Never raises --
     the UI falls back to a free-text model field if this comes back empty."""
@@ -569,7 +580,7 @@ async def probe_models(request: Request):
     return {"models": sorted(set(ids))}
 
 
-@app.post("/api/chat")
+@app.post("/api/chat", dependencies=[Depends(require_proxy_key)])
 async def ui_chat(request: Request):
     """Direct passthrough for the manual test-chat UI: talks to exactly the
     backend/model the user picked, no failover, no Anthropic translation --

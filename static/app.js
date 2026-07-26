@@ -14,10 +14,14 @@ let history = [];
 
 const $ = (id) => document.getElementById(id);
 
-async function api(path, opts) {
+function proxyKey() {
+  return $("proxy-key").value;
+}
+
+async function api(path, opts = {}) {
   const resp = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    headers: { "Content-Type": "application/json", "X-Proxy-Key": proxyKey(), ...opts.headers },
   });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.detail || data.error || `HTTP ${resp.status}`);
@@ -67,17 +71,21 @@ function renderBackendList() {
 }
 
 async function handleCardAction(name, act) {
-  if (act === "delete") {
-    if (!confirm(`Remove backend "${name}"?`)) return;
-    await api(`/api/backends/${encodeURIComponent(name)}`, { method: "DELETE" });
-  } else if (act === "up" || act === "down") {
-    const order = backends.map((b) => b.name);
-    const i = order.indexOf(name);
-    const j = act === "up" ? i - 1 : i + 1;
-    [order[i], order[j]] = [order[j], order[i]];
-    await api("/api/backends/reorder", { method: "POST", body: JSON.stringify({ order }) });
+  try {
+    if (act === "delete") {
+      if (!confirm(`Remove backend "${name}"?`)) return;
+      await api(`/api/backends/${encodeURIComponent(name)}`, { method: "DELETE" });
+    } else if (act === "up" || act === "down") {
+      const order = backends.map((b) => b.name);
+      const i = order.indexOf(name);
+      const j = act === "up" ? i - 1 : i + 1;
+      [order[i], order[j]] = [order[j], order[i]];
+      await api("/api/backends/reorder", { method: "POST", body: JSON.stringify({ order }) });
+    }
+    await loadBackends();
+  } catch (err) {
+    alert(err.message);
   }
-  await loadBackends();
 }
 
 function renderChatSelectors() {
@@ -100,9 +108,13 @@ function renderModelSelector() {
 }
 
 async function loadBackends() {
-  const data = await api("/api/backends");
-  backends = data.backends;
-  renderBackendList();
+  try {
+    const data = await api("/api/backends");
+    backends = data.backends;
+    renderBackendList();
+  } catch (err) {
+    $("backend-list").innerHTML = `<div class="hint error">Couldn't load backends: ${err.message}. Check the proxy key above.</div>`;
+  }
 }
 
 $("add-form").onsubmit = async (e) => {
@@ -190,7 +202,7 @@ async function sendMessage() {
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Proxy-Key": proxyKey() },
       body: JSON.stringify({ backend: backendName, model, messages: history, stream: true }),
     });
 
@@ -241,6 +253,11 @@ async function sendMessage() {
     $("send-btn").disabled = false;
   }
 }
+
+$("proxy-key").value = localStorage.getItem("proxyKey") || "";
+$("proxy-key").addEventListener("change", () => {
+  localStorage.setItem("proxyKey", $("proxy-key").value);
+});
 
 fillPresets();
 loadBackends();
