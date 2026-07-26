@@ -17,6 +17,26 @@ harness). The *model* answering prompts is whichever backend in
 models for free; you're using Claude Code as a CLI frontend for other
 models.
 
+## Web UI
+
+Once the proxy is running, open `http://127.0.0.1:8082/` (or wherever you
+bound it) in a browser for:
+
+- **Backend management** -- pick a provider preset (or "Custom"), paste in
+  its API key, hit "Detect models" to pull the real model list from that
+  provider instead of typing model IDs by hand, and save. Reorder or
+  remove backends with the arrows/× on each card. This edits `backends.json`
+  for you -- no need to hand-edit JSON or paste keys into a chat transcript.
+- **A test chat** -- pick any configured backend + model from the dropdowns
+  and talk to it directly, with streaming responses. This talks straight to
+  the backend you pick (no failover, no Anthropic translation) -- it's for
+  manually verifying a provider/model works before trusting it in the
+  failover chain, separate from how Claude Code itself uses the proxy via
+  `/v1/messages`.
+
+Everything here runs API keys through this local server only -- keys never
+leave the machine the proxy runs on except to reach the provider you picked.
+
 ## Prerequisites
 
 - [Claude Code](https://github.com/anthropics/claude-code) installed (`npm install -g @anthropic-ai/claude-code`)

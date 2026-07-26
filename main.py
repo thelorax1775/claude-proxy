@@ -17,7 +17,8 @@ import uuid
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -48,6 +49,14 @@ def load_backends() -> list[dict]:
 
 
 BACKENDS = load_backends()
+BACKENDS_PATH = os.getenv("BACKENDS_CONFIG", "backends.json")
+
+
+def save_backends():
+    tmp = f"{BACKENDS_PATH}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(BACKENDS, f, indent=2)
+    os.replace(tmp, BACKENDS_PATH)
 
 # Optional: require the client (Claude Code) to send this exact key so the
 # proxy isn't wide open to anything that can reach the port.
@@ -438,6 +447,178 @@ async def health():
 async def status():
     """Recent backend attempts -- watch failover happen in real time."""
     return {"recent_attempts": list(ATTEMPT_LOG)}
+
+
+# ---------------------------------------------------------------------------
+# UI-facing API: manage backends.json and drive a manual test chat, without
+# ever putting API keys through Claude Code or a chat transcript.
+# ---------------------------------------------------------------------------
+
+def public_backend(b: dict) -> dict:
+    return {
+        "name": b["name"],
+        "base_url": b["base_url"],
+        "big_model": b.get("big_model", ""),
+        "small_model": b.get("small_model", ""),
+        "has_key": bool(b.get("api_key")),
+    }
+
+
+@app.get("/api/backends")
+async def list_backends():
+    return {"backends": [public_backend(b) for b in BACKENDS]}
+
+
+@app.post("/api/backends")
+async def add_backend(request: Request):
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    base_url = (body.get("base_url") or "").strip().rstrip("/")
+    if not name or not base_url:
+        raise HTTPException(status_code=400, detail="name and base_url are required")
+    if any(b["name"] == name for b in BACKENDS):
+        raise HTTPException(status_code=409, detail=f"backend '{name}' already exists")
+
+    big_model = (body.get("big_model") or "").strip()
+    entry = {
+        "name": name,
+        "base_url": base_url,
+        "api_key": body.get("api_key") or "",
+        "big_model": big_model,
+        "small_model": (body.get("small_model") or "").strip() or big_model,
+    }
+    BACKENDS.append(entry)
+    save_backends()
+    return public_backend(entry)
+
+
+@app.patch("/api/backends/{name}")
+async def update_backend(name: str, request: Request):
+    body = await request.json()
+    for b in BACKENDS:
+        if b["name"] == name:
+            for field in ("base_url", "api_key", "big_model", "small_model"):
+                if field in body and body[field] is not None:
+                    b[field] = body[field]
+            save_backends()
+            return public_backend(b)
+    raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
+
+
+@app.delete("/api/backends/{name}")
+async def delete_backend(name: str):
+    for i, b in enumerate(BACKENDS):
+        if b["name"] == name:
+            del BACKENDS[i]
+            save_backends()
+            return {"ok": True}
+    raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
+
+
+@app.post("/api/backends/reorder")
+async def reorder_backends(request: Request):
+    body = await request.json()
+    order = body.get("order") or []
+    by_name = {b["name"]: b for b in BACKENDS}
+    if set(order) != set(by_name.keys()):
+        raise HTTPException(status_code=400, detail="order must contain exactly the current backend names")
+    BACKENDS[:] = [by_name[name] for name in order]
+    save_backends()
+    return {"backends": [public_backend(b) for b in BACKENDS]}
+
+
+@app.post("/api/probe-models")
+async def probe_models(request: Request):
+    """Best-effort model discovery for the add-backend form. Never raises --
+    the UI falls back to a free-text model field if this comes back empty."""
+    body = await request.json()
+    base_url = (body.get("base_url") or "").strip().rstrip("/")
+    api_key = body.get("api_key") or ""
+    if not base_url:
+        return {"models": [], "error": "base_url is required"}
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+            resp = await client.get(f"{base_url}/models", headers=headers)
+    except httpx.HTTPError as e:
+        return {"models": [], "error": str(e)}
+
+    if resp.status_code >= 400:
+        return {"models": [], "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"models": [], "error": "backend did not return JSON"}
+
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        ids = [m.get("id") for m in data["data"] if isinstance(m, dict) and m.get("id")]
+    elif isinstance(data, dict) and isinstance(data.get("models"), list):
+        ids = [m.get("name") or m.get("model") for m in data["models"] if isinstance(m, dict)]
+        ids = [i for i in ids if i]
+    elif isinstance(data, list):
+        ids = [m if isinstance(m, str) else m.get("id") for m in data]
+        ids = [i for i in ids if i]
+    else:
+        ids = []
+
+    return {"models": sorted(set(ids))}
+
+
+@app.post("/api/chat")
+async def ui_chat(request: Request):
+    """Direct passthrough for the manual test-chat UI: talks to exactly the
+    backend/model the user picked, no failover, no Anthropic translation --
+    this is a human testing a provider, not Claude Code driving one."""
+    body = await request.json()
+    backend_name = body.get("backend")
+    backend = next((b for b in BACKENDS if b["name"] == backend_name), None)
+    if backend is None:
+        raise HTTPException(status_code=404, detail=f"backend '{backend_name}' not found")
+
+    payload = {
+        "model": body.get("model") or backend.get("big_model"),
+        "messages": body.get("messages", []),
+        "stream": bool(body.get("stream", True)),
+    }
+    url = f"{backend['base_url']}/chat/completions"
+    headers = backend_headers(backend)
+
+    if payload["stream"]:
+        client = httpx.AsyncClient()
+
+        async def gen():
+            try:
+                async with client.stream("POST", url, headers=headers, json=payload,
+                                          timeout=HTTP_TIMEOUT) as resp:
+                    if resp.status_code >= 400:
+                        err = (await resp.aread()).decode("utf-8", "replace")
+                        yield f"data: {json.dumps({'error': err})}\n\n"
+                        return
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+            finally:
+                await client.aclose()
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+        return JSONResponse(content=resp.json())
+
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def ui_index():
+    return FileResponse("static/index.html")
 
 
 @app.post("/v1/messages/count_tokens")
