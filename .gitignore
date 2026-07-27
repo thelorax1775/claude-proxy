@@ -6,4 +6,6 @@ __pycache__/
 .venv/
 workdirs.json
 integrations.json
+ssh_hosts.json
 sessions/
+.pytest_cache/

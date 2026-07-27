@@ -26,6 +26,7 @@ import approvals
 import github_api
 import integrations
 import sessions
+import ssh_tools
 import web_tools
 
 app = FastAPI()
@@ -803,6 +804,9 @@ async def ui_settings():
         "max_agent_iterations": MAX_AGENT_ITERATIONS,
         "round_ceiling": agent_tools.ROUND_CEILING,
         "tool_timeout": agent_tools.AGENT_TOOL_TIMEOUT,
+        "bash_max_timeout": agent_tools.BASH_MAX_TIMEOUT,
+        "ssh_timeout": ssh_tools.SSH_TIMEOUT,
+        "ssh_max_timeout": ssh_tools.SSH_MAX_TIMEOUT,
         "default_workspace": agent_tools.AGENT_WORKSPACE,
         "clone_root": agent_tools.CLONE_ROOT,
         # Whether the operator allows the LAN switch to do anything. The UI
@@ -813,6 +817,9 @@ async def ui_settings():
             {
                 "name": group,
                 "available": usable.get(group, False),
+                # Why not, so the UI can say rather than guess -- a group can
+                # now be unavailable for more than one reason.
+                "reason": agent_tools.group_unavailable_reason(group),
                 "tools": [t["name"] for t in agent_tools.TOOLS if t["group"] == group],
             }
             for group in agent_tools.GROUPS
@@ -841,6 +848,59 @@ async def add_workdir(request: Request):
 
     return agent_tools.public_workdir(
         agent_tools.register_workdir(path, (body.get("label") or "").strip()))
+
+
+# ---------------------------------------------------------------------------
+# SSH hosts -- the list of machines agent mode's ssh tools may connect to.
+# Same shape as the working-directory registry: the server owns the list, and
+# the model picks a name from it rather than inventing a destination.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ssh-hosts")
+async def list_ssh_hosts():
+    return {
+        "hosts": [ssh_tools.public_host(h) for h in ssh_tools.HOSTS],
+        # So the UI can explain an unusable group rather than showing an empty
+        # list and leaving someone to wonder.
+        "ssh_available": ssh_tools.ssh_available(),
+    }
+
+
+@app.post("/api/ssh-hosts")
+async def add_ssh_host(request: Request):
+    body = await request.json()
+    result = ssh_tools.register_host(
+        name=(body.get("name") or "").strip(),
+        host=(body.get("host") or "").strip(),
+        user=(body.get("user") or "").strip(),
+        port=body.get("port") or 22,
+        key_path=(body.get("key_path") or "").strip(),
+        label=(body.get("label") or "").strip(),
+    )
+    if isinstance(result, str):
+        raise HTTPException(status_code=400, detail=result.removeprefix("[error] "))
+    return ssh_tools.public_host(result)
+
+
+@app.delete("/api/ssh-hosts")
+async def delete_ssh_host(name: str):
+    if not ssh_tools.remove_host(name):
+        raise HTTPException(status_code=404, detail=f"no SSH host called '{name}'")
+    return {"ok": True}
+
+
+@app.post("/api/ssh-hosts/{name}/test")
+async def test_ssh_host(name: str):
+    """Connect and run `true`. This is what turns "the tool timed out" into
+    "permission denied (publickey)" before a model is ever involved."""
+    host = ssh_tools.find_host(name)
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"no SSH host called '{name}'")
+    started = time.monotonic()
+    output = await ssh_tools.run_command(host, "true", timeout=20)
+    elapsed = int((time.monotonic() - started) * 1000)
+    ok = not output.startswith("[error]") and not output.startswith("[exit ")
+    return {"ok": ok, "latency_ms": elapsed, "output": output}
 
 
 @app.post("/api/approvals/{call_id}")

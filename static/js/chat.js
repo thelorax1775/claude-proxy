@@ -88,7 +88,7 @@ function addContinue(rounds) {
  *  arguments -- approving "bash" without seeing the command would be theatre. */
 function addApproval(id, name, args, group) {
   clearEmptyState();
-  const risky = ["shell", "files_write", "github_write"].includes(group);
+  const risky = ["shell", "files_write", "github_write", "ssh"].includes(group);
   const card = document.createElement("div");
   card.className = `msg approval${risky ? " risky" : ""}`;
   card.dataset.approvalId = id;

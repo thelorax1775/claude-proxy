@@ -13,11 +13,15 @@ const LABELS = {
   github: ["GitHub", "browse repos, PRs, issues, branches, CI and code"],
   github_write: ["GitHub write", "issues, comments, pull requests, reviews, merges"],
   web: ["Web", "fetch pages, search, and call APIs"],
+  ssh: ["SSH", "run commands and copy files on registered remote hosts"],
 };
 
+// Fallback only: the server now sends a `reason` per group, which is more
+// specific than this can be (ssh is unavailable for two different reasons).
 const NEEDS = {
   github: "needs a GitHub token",
   github_write: "needs a GitHub token",
+  ssh: "needs a registered SSH host",
 };
 
 /** Groups this session wants, minus anything the server can't offer. */
@@ -48,10 +52,12 @@ function renderStatus() {
   const s = store.settings;
   $("agent-status").className = "callout";
   $("agent-status").innerHTML = `<strong>Agent mode runs on the proxy's machine.</strong> Up to
-    ${s.max_agent_iterations} tool rounds per message, ${s.tool_timeout}s per command.
+    ${s.max_agent_iterations} tool rounds per message, ${s.tool_timeout}s per command
+    (a call can ask for up to ${s.bash_max_timeout}s).
     With the sandbox on, the file tools stay inside the ticked directories; with it off
     they can reach anything the proxy's user can. Either way a shell command can walk
-    out on its own — the machine is the real boundary.`;
+    out on its own — the machine is the real boundary, and the SSH group reaches past
+    it entirely.`;
 }
 
 function render() {
@@ -71,7 +77,7 @@ function render() {
           <span class="hint">${group.tools.length} tool${group.tools.length === 1 ? "" : "s"}</span>
         </div>
         <div class="sub plain">${escapeHtml(blurb)}</div>
-        ${group.available ? "" : `<div class="tags"><span class="tag bad">${escapeHtml(NEEDS[group.name] || "unavailable")}</span></div>`}
+        ${group.available ? "" : `<div class="tags"><span class="tag bad">${escapeHtml(group.reason || NEEDS[group.name] || "unavailable")}</span></div>`}
       </div>`;
   }).join("");
 

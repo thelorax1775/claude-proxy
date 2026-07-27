@@ -6,6 +6,7 @@ import { $ } from "./ui.js";
 import { store, on, emit, prefs } from "./store.js";
 import { initBackends, loadBackends } from "./backends.js";
 import { initWorkdirs, loadWorkdirs } from "./workdirs.js";
+import { initSshHosts, loadSshHosts } from "./sshhosts.js";
 import { initGroups, selectedGroups } from "./groups.js";
 import { initGithub, loadRepos } from "./github.js";
 import { initSessions, loadSessions } from "./sessions.js";
@@ -78,7 +79,7 @@ async function loadSettings() {
 
 async function loadAll() {
   await loadSettings();
-  await Promise.all([loadBackends(), loadWorkdirs(), loadSessions()]);
+  await Promise.all([loadBackends(), loadWorkdirs(), loadSshHosts(), loadSessions()]);
   renderPills();
 }
 
@@ -87,6 +88,7 @@ async function loadAll() {
 initShell();
 initBackends();
 initWorkdirs();
+initSshHosts();
 initActivity();
 initSessions();
 initChat();

@@ -22,6 +22,19 @@ RestartSec=3
 # ReadWritePaths read-only. If you add a working directory in the web UI and
 # the agent can't write to it, list it here too (space-separated) and set
 # ProtectHome=false if it lives under /home -- then daemon-reload + restart.
+#
+# ProtectHome=true also hides the service user's own home, so ~/.ssh is
+# unreachable and every SSH tool fails with "Permission denied (publickey)".
+# Rather than switching it off, keep both the key and known_hosts inside the
+# unit's own tree --
+#   install -d -m 700 -o claude-proxy -g claude-proxy /opt/claude-proxy/.ssh
+#   ssh-keygen -t ed25519 -f /opt/claude-proxy/.ssh/id_ed25519 -N ''
+#   chown claude-proxy:claude-proxy /opt/claude-proxy/.ssh/id_ed25519*
+# -- give that absolute path as the host's "Key file" in the Agent tab, and
+# set this in .env so ssh has somewhere it may record host keys:
+#   AGENT_SSH_KNOWN_HOSTS=/opt/claude-proxy/.ssh/known_hosts
+# Without that last line ssh cannot write known_hosts and every connection
+# fails on the host-key check.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

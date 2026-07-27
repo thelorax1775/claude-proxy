@@ -15,6 +15,10 @@ export const store = {
   githubUser: null,
   backends: [],
   workdirs: [],
+  sshHosts: [],
+  // Whether the proxy's machine has an ssh client at all, so the panel can
+  // say so rather than showing an empty list.
+  sshAvailable: false,
   selectedDirs: new Set(),
   groups: new Set(),
   sessions: [],

@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import sys
 
 import git_tools
 import github_api
 import integrations
+import ssh_tools
 import web_tools
 
 log = logging.getLogger("claude-proxy")
@@ -48,6 +50,9 @@ CLONE_ROOT = norm_path(os.getenv("AGENT_CLONE_ROOT", os.path.join(AGENT_WORKSPAC
 WORKDIRS_PATH = os.getenv("AGENT_DIRS_CONFIG", "workdirs.json")
 
 AGENT_TOOL_TIMEOUT = int(os.getenv("AGENT_TOOL_TIMEOUT", "30"))
+# Ceiling for bash's optional per-call timeout. The default above stays 30s;
+# this only bounds what a single call may ask for.
+BASH_MAX_TIMEOUT = int(os.getenv("AGENT_BASH_MAX_TIMEOUT", "300"))
 AGENT_OUTPUT_LIMIT = int(os.getenv("AGENT_OUTPUT_LIMIT", "8000"))
 # Reviewing a real codebase is dozens of reads, so the default budget is
 # deliberately high -- the loop stops on its own the moment the model answers.
@@ -75,9 +80,10 @@ def clamp_rounds(requested) -> int:
 SEARCH_TIMEOUT = AGENT_TOOL_TIMEOUT
 SEARCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_search.py")
 
-GROUPS = ["shell", "files", "files_write", "git", "github", "github_write", "web"]
-# Everything except the two groups that do something you can't take back: post
-# to other people's repositories, and delete files.
+GROUPS = ["shell", "files", "files_write", "git", "github", "github_write", "web", "ssh"]
+# Everything except the three groups that do something you can't take back:
+# post to other people's repositories, delete files, and act on a machine this
+# proxy's sandbox has no authority over.
 DEFAULT_GROUPS = ["shell", "files", "git", "github", "web"]
 
 # How tool calls are gated in agent mode:
@@ -201,7 +207,8 @@ class AgentContext:
 
 def available_groups() -> dict:
     """Which groups are usable right now. GitHub needs a token; web search
-    needs a provider key, though web_fetch works without one."""
+    needs a provider key, though web_fetch works without one; ssh needs both a
+    registered host and an ssh client to drive."""
     has_github = bool(integrations.get("github_token"))
     return {
         "shell": True,
@@ -211,7 +218,22 @@ def available_groups() -> dict:
         "github": has_github,
         "github_write": has_github,
         "web": True,
+        "ssh": bool(ssh_tools.HOSTS) and ssh_tools.ssh_available(),
     }
+
+
+def group_unavailable_reason(group: str) -> str:
+    """Why a group can't be used, for the UI to show instead of guessing.
+    Empty when it is usable."""
+    if available_groups().get(group):
+        return ""
+    if group in ("github", "github_write"):
+        return "needs a GitHub token"
+    if group == "ssh":
+        if not ssh_tools.ssh_available():
+            return "the ssh command is not installed on the proxy"
+        return "needs a registered SSH host"
+    return ""
 
 
 def build_agent_context(requested_paths, sandbox_requested: bool, requested_groups=None,
@@ -268,7 +290,19 @@ def resolve_agent_path(ctx: AgentContext, path: str) -> str:
 _stop_process = git_tools.stop_process
 
 
-async def run_bash(ctx, command: str, cwd: str = "") -> str:
+def clamp_tool_timeout(requested) -> int:
+    """Per-call timeout for bash, bounded. The 30s default is right for the
+    commands agent mode mostly runs, but a test suite or a build is a normal
+    thing to ask for and simply cannot finish inside it."""
+    try:
+        value = int(requested)
+    except (TypeError, ValueError):
+        return AGENT_TOOL_TIMEOUT
+    return max(1, min(value, BASH_MAX_TIMEOUT))
+
+
+async def run_bash(ctx, command: str, cwd: str = "", timeout=None) -> str:
+    seconds = clamp_tool_timeout(timeout)
     try:
         workdir = resolve_agent_path(ctx, cwd) if cwd else ctx.cwd
         if not os.path.isdir(workdir):
@@ -278,10 +312,11 @@ async def run_bash(ctx, command: str, cwd: str = "") -> str:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TOOL_TIMEOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=seconds)
         except asyncio.TimeoutError:
             await _stop_process(proc)
-            return f"[error] command timed out after {AGENT_TOOL_TIMEOUT}s"
+            return (f"[error] command timed out after {seconds}s. Pass a larger "
+                    f"'timeout' if it genuinely needs longer (max {BASH_MAX_TIMEOUT}s).")
         except BaseException:
             # CancelledError is a BaseException, so a Stop press lands here
             # rather than in either except clause below.
@@ -934,6 +969,92 @@ async def run_web_search(ctx, query: str, limit: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ssh
+#
+# Every handler resolves a registered host *name* first. There is deliberately
+# no way to give these tools a connection string: the registry is the list of
+# machines this proxy may reach, and it is edited by a person, not chosen by a
+# model mid-conversation.
+# ---------------------------------------------------------------------------
+
+def _ssh_host(name: str):
+    """(host, "") or (None, error). Kept separate so every handler refuses an
+    unknown name the same way, and points at the tool that lists them."""
+    host = ssh_tools.find_host((name or "").strip())
+    if host is None:
+        known = ", ".join(h["name"] for h in ssh_tools.HOSTS) or "none registered"
+        return None, (f"[error] no SSH host called '{name}' is registered. "
+                      f"Known hosts: {known}. Use ssh_list_hosts to see them.")
+    return host, ""
+
+
+async def run_ssh_list_hosts(ctx) -> str:
+    if not ssh_tools.HOSTS:
+        return ("No SSH hosts are registered. They are added in the Agent tab of "
+                "the web UI; you cannot add one yourself.")
+    lines = []
+    for h in ssh_tools.HOSTS:
+        key = "configured key" if h["key_path"] else "default keys/agent"
+        label = f"  ({h['label']})" if h["label"] != h["name"] else ""
+        lines.append(f"{h['name']}: {ssh_tools.describe(h)}  [{key}]{label}")
+    return "\n".join(lines)
+
+
+async def run_ssh_run(ctx, host: str, command: str, cwd: str = "", timeout=None) -> str:
+    entry, error = _ssh_host(host)
+    if error:
+        return error
+    if cwd:
+        problem = ssh_tools.check_remote_path(cwd)
+        if problem:
+            return problem
+        # The far side of ssh is a shell by definition, so this is quoting for
+        # that shell, not an attempt to avoid one.
+        command = f"cd {shlex.quote(cwd)} && {command}"
+    out = await ssh_tools.run_command(entry, command, ssh_tools.clamp_timeout(timeout))
+    return github_api.scrub(out)
+
+
+async def run_ssh_upload(ctx, host: str, local_path: str, remote_path: str, timeout=None) -> str:
+    entry, error = _ssh_host(host)
+    if error:
+        return error
+    problem = ssh_tools.check_remote_path(remote_path)
+    if problem:
+        return problem
+    try:
+        # The local side goes through the same confinement as every other file
+        # tool: the sandbox switch decides what may leave this machine.
+        local = resolve_agent_path(ctx, local_path)
+    except ValueError as e:
+        return f"[error] {e}"
+    if not os.path.isfile(local):
+        return f"[error] '{local}' is not a file"
+    return github_api.scrub(await ssh_tools.copy_file(
+        entry, local, remote_path, upload=True, timeout=ssh_tools.clamp_timeout(timeout)))
+
+
+async def run_ssh_download(ctx, host: str, remote_path: str, local_path: str, timeout=None) -> str:
+    entry, error = _ssh_host(host)
+    if error:
+        return error
+    problem = ssh_tools.check_remote_path(remote_path)
+    if problem:
+        return problem
+    try:
+        local = resolve_agent_path(ctx, local_path)
+    except ValueError as e:
+        return f"[error] {e}"
+    if os.path.exists(local):
+        # Same rule as move_file: silently replacing a local file with a
+        # remote one is not something to do without being asked.
+        return f"[error] '{local}' already exists; choose another name"
+    os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+    return github_api.scrub(await ssh_tools.copy_file(
+        entry, local, remote_path, upload=False, timeout=ssh_tools.clamp_timeout(timeout)))
+
+
+# ---------------------------------------------------------------------------
 # registry
 # ---------------------------------------------------------------------------
 
@@ -962,7 +1083,8 @@ TOOLS = [
     _tool("shell", "bash",
           "Run a shell command. Runs in the session's primary working directory unless 'cwd' says otherwise. Output (stdout+stderr) is truncated if large.",
           {"command": {**STR, "description": "Shell command to run"},
-           "cwd": {**STR, "description": "Directory to run in; must be inside a working directory while sandboxed"}},
+           "cwd": {**STR, "description": "Directory to run in; must be inside a working directory while sandboxed"},
+           "timeout": {**INT, "description": f"Seconds to allow; defaults to {AGENT_TOOL_TIMEOUT}, max {BASH_MAX_TIMEOUT}. Raise it for builds and test suites."}},
           ["command"], run_bash),
 
     _tool("files", "read_file",
@@ -1133,6 +1255,31 @@ TOOLS = [
            "headers": {**OBJ, "description": "Header name -> value, e.g. {\"Authorization\": \"Bearer ...\"}"},
            "body": {**STR, "description": "Request body, already serialised (e.g. a JSON string)"}},
           ["method", "url"], run_http_request),
+
+    _tool("ssh", "ssh_list_hosts",
+          "List the SSH hosts this proxy is allowed to connect to. Commands run on a host by NAME from this list; there is no way to connect to anything else.",
+          {}, (), run_ssh_list_hosts),
+    _tool("ssh", "ssh_run",
+          "Run a shell command on a registered remote host and return its output. Non-interactive: a command that waits for input will time out rather than prompt.",
+          {"host": {**STR, "description": "Registered host name, from ssh_list_hosts"},
+           "command": {**STR, "description": "Shell command to run on that host"},
+           "cwd": {**STR, "description": "Directory on the remote host to run in"},
+           "timeout": {**INT, "description": f"Seconds to allow; defaults to {ssh_tools.SSH_TIMEOUT}, max {ssh_tools.SSH_MAX_TIMEOUT}"}},
+          ["host", "command"], run_ssh_run),
+    _tool("ssh", "ssh_upload",
+          "Copy a local file to a registered remote host. The local path obeys this session's working directories exactly as the file tools do.",
+          {"host": STR,
+           "local_path": {**STR, "description": "File on this machine, relative or absolute"},
+           "remote_path": {**STR, "description": "Destination path on the remote host"},
+           "timeout": INT},
+          ["host", "local_path", "remote_path"], run_ssh_upload),
+    _tool("ssh", "ssh_download",
+          "Copy a file from a registered remote host to this machine. Refuses to overwrite an existing local file.",
+          {"host": STR,
+           "remote_path": {**STR, "description": "File on the remote host"},
+           "local_path": {**STR, "description": "Destination on this machine; must not already exist"},
+           "timeout": INT},
+          ["host", "remote_path", "local_path"], run_ssh_download),
 ]
 
 BY_NAME = {t["name"]: t for t in TOOLS}
@@ -1244,6 +1391,23 @@ def agent_system_prompt(ctx: AgentContext) -> str:
                 "web_fetch reaches the public internet only; private and loopback "
                 "addresses are refused. Say so rather than trying to work around it."
             )
+
+    if ctx.allows("ssh"):
+        names = ", ".join(h["name"] for h in ssh_tools.HOSTS) or "none"
+        lines.append(
+            f"You can also reach other machines over SSH. Registered hosts: {names}. "
+            "Refer to a host by that name -- there is no way to connect to anything "
+            "not on the list, and you cannot add to it. "
+            "Commands there run on a DIFFERENT machine: the working directories and "
+            "the sandbox above say nothing about what you can touch on it, and there "
+            "is no undo. Read before you change, and only run something destructive if "
+            "the user asked for that specific thing on that specific host. "
+            "Sessions are non-interactive, so a command that waits for input will time "
+            "out instead of prompting -- prefer non-interactive flags (-y and the like). "
+            f"Long jobs take a 'timeout' argument, up to {ssh_tools.SSH_MAX_TIMEOUT}s. "
+            "Move files with ssh_upload/ssh_download rather than pasting them through a "
+            "shell command; their local side obeys the working-directory rules above."
+        )
 
     lines.append(
         "When you're done, reply with a short plain-text summary of what you did and "

@@ -111,6 +111,33 @@
       </form>
 
       <div class="section-head">
+        <h2>SSH hosts</h2>
+        <span class="hint">for the SSH tool group</span>
+      </div>
+      <div id="ssh-host-list" class="stack"></div>
+
+      <form class="form inline-form" id="add-ssh-form">
+        <label>Name <span class="hint">how the model refers to it</span>
+          <input id="f-ssh-name" placeholder="e.g. nas" autocomplete="off">
+        </label>
+        <label>Host
+          <input id="f-ssh-host" placeholder="hostname or IP" autocomplete="off">
+        </label>
+        <label>User <span class="hint">optional</span>
+          <input id="f-ssh-user" placeholder="defaults to your ssh config" autocomplete="off">
+        </label>
+        <label>Port
+          <input id="f-ssh-port" type="number" min="1" max="65535" placeholder="22" autocomplete="off">
+        </label>
+        <label>Key file <span class="hint">optional, absolute path</span>
+          <input id="f-ssh-key" placeholder="~/.ssh/id_ed25519" autocomplete="off">
+        </label>
+        <button type="submit" class="primary-btn">Add host</button>
+        <p class="hint">Key-based auth only — no passwords are stored or accepted.</p>
+        <p class="hint error" id="ssh-error"></p>
+      </form>
+
+      <div class="section-head">
         <h2>Web search</h2>
       </div>
       <form class="form inline-form" id="search-form">
