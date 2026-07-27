@@ -15,21 +15,7 @@ function persistSelection() {
   prefs.set("selectedDirs", [...store.selectedDirs]);
 }
 
-function renderStatus() {
-  const box = $("agent-status");
-  const s = store.settings;
-  box.className = "callout";
-  box.innerHTML = `<strong>Agent mode runs on the proxy's machine.</strong> Up to
-    ${s.max_agent_iterations} tool rounds per message, ${s.tool_timeout}s per command.
-    With the sandbox on, the file tools stay inside the ticked directories; with it off
-    they can reach anything the proxy's user can. Either way a shell command can walk
-    out on its own — the machine is the real boundary.`;
-}
-
 function render() {
-  renderStatus();
-  $("tool-list").innerHTML = store.settings.tools.map((t) => `<span class="chip">${escapeHtml(t)}</span>`).join("");
-
   const list = $("workdir-list");
   if (store.workdirs.length === 0) {
     list.innerHTML = `<p class="hint">No directories registered.</p>`;

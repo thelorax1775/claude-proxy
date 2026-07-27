@@ -6,6 +6,8 @@ import { postStream, sseJson } from "./api.js";
 import { $, escapeHtml, renderRich, shorten, autoGrow } from "./ui.js";
 import { store, on, emit, prefs } from "./store.js";
 import { selectedPaths } from "./workdirs.js";
+import { selectedGroups, maxRounds } from "./groups.js";
+import { ensureSession, saveCurrent, newSession } from "./sessions.js";
 
 let inFlight = null;
 // What the last agent run was scoped to, so the scope notice only shows up
@@ -16,16 +18,21 @@ const EMPTY_STATE = `
   <div class="empty-state">
     <strong>Nothing here yet</strong>
     <span>Pick a backend and model above, then say something. Turn on
-    <em>Agent tools</em> below to let the model work on real directories.</span>
+    <em>Agent tools</em> below to let the model work on real directories,
+    repositories and the web.</span>
   </div>`;
 
 function messagesEl() {
   return $("messages");
 }
 
-function scrollDown() {
+/** Follow the stream only while the reader is already at the bottom --
+ *  yanking the view down while someone is scrolled up reading is the other
+ *  half of "the chat gets messed up as it gets longer". */
+function scrollDown(force = false) {
   const el = messagesEl();
-  el.scrollTop = el.scrollHeight;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  if (force || nearBottom) el.scrollTop = el.scrollHeight;
 }
 
 function clearEmptyState() {
@@ -42,7 +49,9 @@ function addMessage(role, text, { error = false, streaming = false } = {}) {
   body.innerHTML = renderRich(text);
   if (streaming) body.classList.add("cursor");
   messagesEl().appendChild(wrap);
-  scrollDown();
+  // Your own message always scrolls into view; everything else respects
+  // where you were reading.
+  scrollDown(role === "user");
   return body;
 }
 
@@ -52,6 +61,23 @@ function addNotice(text) {
   wrap.className = "msg notice";
   wrap.innerHTML = `<div class="body"></div>`;
   wrap.querySelector(".body").textContent = text;
+  messagesEl().appendChild(wrap);
+  scrollDown();
+}
+
+/** Shown when a message uses up its tool-round budget. The run paused with a
+ *  status report; this just sends the follow-up that resumes it. */
+function addContinue(rounds) {
+  clearEmptyState();
+  const wrap = document.createElement("div");
+  wrap.className = "msg notice continue-notice";
+  wrap.innerHTML = `<div class="body">Paused after ${rounds} tool rounds — the chat is intact.
+    <button class="ghost-btn small" data-act="continue">Continue</button></div>`;
+  wrap.querySelector("button").onclick = () => {
+    wrap.remove();
+    $("composer-input").value = "Continue where you left off.";
+    sendMessage();
+  };
   messagesEl().appendChild(wrap);
   scrollDown();
 }
@@ -82,6 +108,46 @@ function finishToolCall(card, output) {
   card.querySelector(".output-block").textContent = output || "(no output)";
   if (failed) card.open = true;
   scrollDown();
+}
+
+// ---------------------------------------------------------------------------
+// transcript <-> saved session
+// ---------------------------------------------------------------------------
+
+function record(event) {
+  store.events.push(event);
+}
+
+function sessionState(backend, model, agent, sandbox, groups) {
+  return {
+    backend, model, agent, sandbox, groups,
+    workdirs: selectedPaths(),
+    messages: store.history,
+    events: store.events,
+  };
+}
+
+/** Rebuild the visible chat from a saved session's event list. */
+function replayTranscript() {
+  const el = messagesEl();
+  el.innerHTML = "";
+  lastContextKey = "";
+
+  for (const event of store.events) {
+    if (event.t === "user") addMessage("user", event.text);
+    else if (event.t === "assistant") addMessage("assistant", event.text, { error: event.error });
+    else if (event.t === "notice") addNotice(event.text);
+    else if (event.t === "tool") finishToolCall(addToolCall(event.name, event.args || {}), event.output || "");
+  }
+
+  if (store.events.length === 0) el.innerHTML = EMPTY_STATE;
+  renderChatTitle();
+  scrollDown();
+}
+
+function renderChatTitle() {
+  const current = store.sessions.find((s) => s.id === store.sessionId);
+  $("chat-title").textContent = current ? current.title : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +239,14 @@ async function sendMessage() {
 
   const agent = agentOn();
   const sandbox = sandboxOn();
+  const groups = selectedGroups();
 
   input.value = "";
   autoGrow(input);
   store.history.push({ role: "user", content: text });
+  record({ t: "user", text });
   addMessage("user", text);
+  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups));
 
   // Plain chat streams tokens into one bubble; agent mode emits whole
   // rounds, so its bubbles are created as events arrive.
@@ -186,6 +255,7 @@ async function sendMessage() {
   const agentTexts = [];
   let streamed = "";
   let sawError = false;
+  let hitLimit = 0;
 
   inFlight = new AbortController();
   setBusy(true);
@@ -198,6 +268,8 @@ async function sendMessage() {
       stream: true,
       agent,
       sandbox,
+      groups,
+      max_rounds: maxRounds(),
       workdirs: selectedPaths(),
     }, inFlight.signal);
 
@@ -211,6 +283,7 @@ async function sendMessage() {
       } else {
         addMessage("assistant", message, { error: true });
       }
+      record({ t: "assistant", text: message, error: true });
       store.history.pop();
       return;
     }
@@ -218,16 +291,23 @@ async function sendMessage() {
     for await (const chunk of sseJson(resp)) {
       if (chunk.agent_context) {
         const { roots, sandbox: sandboxed } = chunk.agent_context;
+        // A clone during the run adds a directory -- refresh the panel so the
+        // scope shown on screen matches what the model is actually using.
+        if (chunk.workdirs_changed) emit("workdirs-stale");
         const key = JSON.stringify([roots, sandboxed]);
         if (key !== lastContextKey) {
           lastContextKey = key;
-          addNotice(`${sandboxed ? "Sandboxed" : "UNSANDBOXED"} agent run · ${roots.join(" · ")}`);
+          const notice = `${sandboxed ? "Sandboxed" : "UNSANDBOXED"} agent run · ${roots.join(" · ")}`;
+          addNotice(notice);
+          record({ t: "notice", text: notice });
         }
         continue;
       }
 
       if (chunk.claude_proxy_switch) {
-        addNotice(`Switched to "${chunk.claude_proxy_switch}" (${chunk.claude_proxy_model}) after the previous backend ran out.`);
+        const notice = `Switched to "${chunk.claude_proxy_switch}" (${chunk.claude_proxy_model}) after the previous backend ran out.`;
+        addNotice(notice);
+        record({ t: "notice", text: notice });
         $("chat-backend").value = chunk.claude_proxy_switch;
         renderModelSelector();
         $("chat-model").value = chunk.claude_proxy_model;
@@ -237,20 +317,27 @@ async function sendMessage() {
       if (chunk.agent_text) {
         agentTexts.push(chunk.agent_text);
         addMessage("assistant", chunk.agent_text);
+        record({ t: "assistant", text: chunk.agent_text });
         continue;
       }
 
       if (chunk.agent_tool_call) {
         const { id, name, arguments: args } = chunk.agent_tool_call;
-        toolCards.set(id, addToolCall(name, args || {}));
+        toolCards.set(id, { card: addToolCall(name, args || {}), name, args: args || {} });
         continue;
       }
 
       if (chunk.agent_tool_result) {
         const { id, name, output } = chunk.agent_tool_result;
-        const card = toolCards.get(id);
-        if (card) finishToolCall(card, output);
+        const entry = toolCards.get(id);
+        if (entry) finishToolCall(entry.card, output);
         else finishToolCall(addToolCall(name, {}), output);
+        record({ t: "tool", name, args: entry ? entry.args : {}, output });
+        continue;
+      }
+
+      if (chunk.agent_limit) {
+        hitLimit = chunk.agent_limit;
         continue;
       }
 
@@ -259,6 +346,7 @@ async function sendMessage() {
       if (chunk.error) {
         sawError = true;
         addMessage("assistant", chunk.error, { error: true });
+        record({ t: "assistant", text: chunk.error, error: true });
         continue;
       }
 
@@ -276,13 +364,21 @@ async function sendMessage() {
     const finalText = agent ? agentTexts.join("\n\n") : streamed;
     if (finalText) store.history.push({ role: "assistant", content: finalText });
     else if (sawError) store.history.pop();
+    if (!agent && streamed) record({ t: "assistant", text: streamed });
+    if (hitLimit) addContinue(hitLimit);
   } catch (err) {
     if (err.name === "AbortError") {
       addNotice("Stopped.");
-      if (streamed) store.history.push({ role: "assistant", content: streamed });
-      else store.history.pop();
+      record({ t: "notice", text: "Stopped." });
+      if (streamed) {
+        store.history.push({ role: "assistant", content: streamed });
+        record({ t: "assistant", text: streamed });
+      } else {
+        store.history.pop();
+      }
     } else {
       addMessage("assistant", err.message, { error: true });
+      record({ t: "assistant", text: err.message, error: true });
       store.history.pop();
     }
   } finally {
@@ -290,6 +386,7 @@ async function sendMessage() {
     inFlight = null;
     setBusy(false);
     input.focus();
+    await saveCurrent(sessionState(backend, model, agent, sandbox, groups));
   }
 }
 
@@ -310,9 +407,8 @@ export function initChat() {
   };
 
   $("clear-btn").onclick = () => {
-    store.history = [];
-    lastContextKey = "";
-    messagesEl().innerHTML = EMPTY_STATE;
+    newSession();
+    $("composer-input").focus();
   };
 
   input.addEventListener("keydown", (e) => {
@@ -340,6 +436,12 @@ export function initChat() {
   on("backends", renderBackendSelector);
   on("settings", syncToggles);
   on("workdirs", syncToggles);
+  on("sessions", renderChatTitle);
+  on("session-load", () => {
+    replayTranscript();
+    syncToggles();
+  });
+  on("composer-filled", () => autoGrow($("composer-input")));
 
   renderBackendSelector();
   syncToggles();

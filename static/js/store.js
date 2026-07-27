@@ -7,12 +7,21 @@ export const store = {
     max_agent_iterations: 0,
     tool_timeout: 0,
     default_workspace: "",
-    tools: [],
+    clone_root: "",
+    groups: [],
+    default_groups: [],
   },
+  integrations: { github: { configured: false }, search: { configured: false, providers: [] } },
+  githubUser: null,
   backends: [],
   workdirs: [],
   selectedDirs: new Set(),
+  groups: new Set(),
+  sessions: [],
+  sessionId: null,
+  // history is what the model sees; events is what the UI replays.
   history: [],
+  events: [],
 };
 
 const listeners = new Map();

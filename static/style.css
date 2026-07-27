@@ -219,6 +219,30 @@ body {
 .card .title { font-size: 0.88rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; min-width: 0; }
 .card .ordinal { color: var(--faint); font-variant-numeric: tabular-nums; font-weight: 500; }
 .card .sub { font-size: 0.72rem; color: var(--muted); word-break: break-all; font-family: var(--mono); }
+.card .sub.plain { font-family: inherit; word-break: normal; }
+.card .title[data-act="open"] { cursor: pointer; }
+.card .title[data-act="open"]:hover { color: var(--accent); }
+.group-card .row { align-items: center; }
+
+a.icon-btn { text-decoration: none; display: inline-block; }
+
+.button-row { display: flex; gap: 0.4rem; }
+.button-row .primary-btn, .button-row .ghost-btn { flex: 1; }
+
+.block-label { display: block; }
+.block-label input { margin-top: 0.3rem; }
+.block-label .hint { display: block; margin-top: 0.3rem; }
+
+.continue-notice .body { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+
+.chat-title {
+  font-size: 0.78rem;
+  color: var(--muted);
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .card .actions { display: flex; gap: 0.1rem; flex-shrink: 0; }
 .card.is-selected { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .card.is-missing { border-style: dashed; }
@@ -401,7 +425,16 @@ button { font: inherit; cursor: pointer; }
   gap: 0.75rem;
 }
 
-.msg { max-width: min(74ch, 100%); display: flex; flex-direction: column; gap: 0.2rem; }
+/* flex-shrink:0 matters: in a scrolling flex column, children compress to fit
+   instead of overflowing, so without it every bubble squashes as the chat
+   grows. */
+.msg {
+  max-width: min(74ch, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  flex-shrink: 0;
+}
 .msg .who { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint); }
 
 .msg .body {
@@ -471,6 +504,7 @@ button { font: inherit; cursor: pointer; }
   align-self: flex-start;
   max-width: min(90ch, 100%);
   width: 100%;
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);

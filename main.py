@@ -21,6 +21,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+import agent_tools
+import github_api
+import integrations
+import sessions
+
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("claude-proxy")
@@ -73,391 +78,13 @@ def record_attempt(backend_name: str, outcome: str):
 
 
 # ---------------------------------------------------------------------------
-# Agent tools -- only reachable from the web UI's chat when explicitly
-# opted into (never wired into /v1/messages -- Claude Code's own tools are
-# unaffected).
-#
-# Agent mode, the sandbox, and the working directories are all controlled
-# from the UI at request time; there is no server-side switch to flip first
-# and no auth in front of the proxy. Whoever can reach the port can give the
-# model a shell on this machine, so what the proxy binds to (PROXY_HOST) is
-# the only thing limiting that -- keep it on localhost or a private network.
-#
-# "Sandboxed" means the file tools refuse any path outside the working
-# directories selected for the session, and bash starts in one of them. That
-# is a guardrail against a confused model, not a security boundary: a shell
-# command can still cd out or use absolute paths. The real boundary is the
-# container and the unprivileged user this proxy runs as -- treat it as
-# disposable, not as something holding anything you'd mind an LLM touching.
+# Agent mode lives in agent_tools.py: the working-directory registry, the
+# tool implementations, and the group registry that decides what a run may
+# call. Only the loop that drives it stays here, since that needs the
+# backend-failover machinery below.
 # ---------------------------------------------------------------------------
 
-
-def norm_path(p: str) -> str:
-    """Absolute, ~-expanded, symlinks resolved. Resolving symlinks matters:
-    otherwise a link inside a working directory would defeat the confinement
-    check by pointing anywhere."""
-    return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
-
-
-AGENT_WORKSPACE = norm_path(os.getenv("AGENT_WORKSPACE", "workspace"))
-os.makedirs(AGENT_WORKSPACE, exist_ok=True)
-
-# Extra working directories added through the UI live here, so they survive a
-# restart the same way backends.json does.
-WORKDIRS_PATH = os.getenv("AGENT_DIRS_CONFIG", "workdirs.json")
-
-AGENT_TOOL_TIMEOUT = int(os.getenv("AGENT_TOOL_TIMEOUT", "30"))
-AGENT_OUTPUT_LIMIT = int(os.getenv("AGENT_OUTPUT_LIMIT", "8000"))
-MAX_AGENT_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "12"))
-
-# Directories never worth walking into during a search.
-SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
-SEARCH_MAX_MATCHES = 200
-SEARCH_MAX_FILES = 5000
-
-AGENT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command on this container. Runs in the session's primary working directory unless 'cwd' says otherwise. Output (stdout+stderr combined) is truncated if large.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command to run"},
-                    "cwd": {"type": "string", "description": "Directory to run in; must be one of the session's working directories (or inside one) while sandboxed"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file. Relative paths resolve against the primary working directory; absolute paths are allowed if they're inside a working directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path, relative or absolute"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write (create or overwrite) a text file, creating parent directories as needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path, relative or absolute"},
-                    "content": {"type": "string", "description": "Full file content to write"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Replace an exact snippet of text in an existing file. Fails if the snippet is missing or appears more than once, so read the file first and quote enough context to be unique.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path, relative or absolute"},
-                    "old_text": {"type": "string", "description": "Exact text to replace, including indentation"},
-                    "new_text": {"type": "string", "description": "Replacement text"},
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "List the files and directories inside a directory. Defaults to the primary working directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path; defaults to '.'"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "Recursively search text files for a regular expression and return matching 'path:line: text' hits. Skips .git, node_modules and similar.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Python regular expression to search for"},
-                    "path": {"type": "string", "description": "Directory to search under; defaults to '.'"},
-                    "file_glob": {"type": "string", "description": "Optional filename glob filter, e.g. '*.py'"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-]
-
-
-def _truncate(text: str) -> str:
-    if len(text) <= AGENT_OUTPUT_LIMIT:
-        return text
-    return text[:AGENT_OUTPUT_LIMIT] + f"\n...[truncated, {len(text)} bytes total]"
-
-
-def path_within(target: str, root: str) -> bool:
-    return target == root or target.startswith(root.rstrip(os.sep) + os.sep)
-
-
-# ---------------------------------------------------------------------------
-# Working directories -- the set of places agent mode is allowed to operate
-# in. The AGENT_WORKSPACE entry is always present and can't be removed;
-# everything else is added/removed from the UI and persisted to WORKDIRS_PATH.
-# ---------------------------------------------------------------------------
-
-def load_workdirs() -> list[dict]:
-    saved = []
-    if os.path.exists(WORKDIRS_PATH):
-        try:
-            with open(WORKDIRS_PATH) as f:
-                raw = json.load(f)
-        except (OSError, ValueError) as e:
-            log.warning("could not read %s (%s) -- starting with the default workspace only", WORKDIRS_PATH, e)
-            raw = []
-        for item in raw if isinstance(raw, list) else []:
-            if isinstance(item, str):
-                item = {"path": item}
-            if not isinstance(item, dict) or not item.get("path"):
-                continue
-            path = norm_path(item["path"])
-            if path == AGENT_WORKSPACE or any(d["path"] == path for d in saved):
-                continue
-            saved.append({
-                "path": path,
-                "label": item.get("label") or os.path.basename(path) or path,
-                "default": False,
-            })
-    return [{"path": AGENT_WORKSPACE, "label": "workspace", "default": True}] + saved
-
-
-WORKDIRS = load_workdirs()
-
-
-def save_workdirs():
-    payload = [{"path": d["path"], "label": d["label"]} for d in WORKDIRS if not d["default"]]
-    tmp = f"{WORKDIRS_PATH}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, WORKDIRS_PATH)
-
-
-def public_workdir(d: dict) -> dict:
-    return {
-        "path": d["path"],
-        "label": d["label"],
-        "default": d["default"],
-        "exists": os.path.isdir(d["path"]),
-        "writable": os.access(d["path"], os.W_OK),
-    }
-
-
-class AgentContext:
-    """What one agent-mode message is allowed to touch: an ordered list of
-    working directories (the first is where bash starts) and whether path
-    confinement is on."""
-
-    def __init__(self, roots: list[str], sandbox: bool):
-        self.roots = roots
-        self.sandbox = sandbox
-
-    @property
-    def cwd(self) -> str:
-        for root in self.roots:
-            if os.path.isdir(root):
-                return root
-        return AGENT_WORKSPACE
-
-
-def build_agent_context(requested_paths, sandbox_requested: bool) -> AgentContext:
-    """Map what the browser asked for onto directories that are actually
-    registered. Unknown paths are ignored rather than trusted -- a session
-    picks from the list, it doesn't invent entries mid-request (add the
-    directory through /api/workdirs first)."""
-    registered = [d["path"] for d in WORKDIRS]
-    roots = []
-    for p in requested_paths or []:
-        if not isinstance(p, str):
-            continue
-        path = norm_path(p)
-        if path in registered and path not in roots:
-            roots.append(path)
-    if not roots:
-        roots = [AGENT_WORKSPACE]
-    return AgentContext(roots, bool(sandbox_requested))
-
-
-def resolve_agent_path(ctx: AgentContext, path: str) -> str:
-    raw = os.path.expanduser(path or ".")
-    target = norm_path(raw if os.path.isabs(raw) else os.path.join(ctx.cwd, raw))
-    if ctx.sandbox and not any(path_within(target, root) for root in ctx.roots):
-        raise ValueError(
-            f"'{path}' is outside this session's working directories "
-            f"({', '.join(ctx.roots)}) and the sandbox is on"
-        )
-    return target
-
-
-async def run_bash(ctx: AgentContext, command: str, cwd: str | None = None) -> str:
-    try:
-        workdir = resolve_agent_path(ctx, cwd) if cwd else ctx.cwd
-        if not os.path.isdir(workdir):
-            return f"[error] working directory '{workdir}' does not exist"
-        proc = await asyncio.create_subprocess_shell(
-            command, cwd=workdir,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return f"[error] command timed out after {AGENT_TOOL_TIMEOUT}s"
-        text = out.decode("utf-8", "replace")
-        status = "" if proc.returncode == 0 else f"[exit {proc.returncode}]\n"
-        return _truncate(status + (text or "(no output)"))
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def run_read_file(ctx: AgentContext, path: str) -> str:
-    try:
-        target = resolve_agent_path(ctx, path)
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            return _truncate(f.read())
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def run_write_file(ctx: AgentContext, path: str, content: str) -> str:
-    try:
-        target = resolve_agent_path(ctx, path)
-        parent = os.path.dirname(target)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"wrote {len(content)} bytes to {target}"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def run_edit_file(ctx: AgentContext, path: str, old_text: str, new_text: str) -> str:
-    try:
-        target = resolve_agent_path(ctx, path)
-        with open(target, "r", encoding="utf-8") as f:
-            content = f.read()
-        if not old_text:
-            return "[error] old_text is required -- use write_file to create a file from scratch"
-        occurrences = content.count(old_text)
-        if occurrences == 0:
-            return "[error] old_text not found in the file -- read it again and quote the exact text"
-        if occurrences > 1:
-            return f"[error] old_text appears {occurrences} times -- include more surrounding context so it's unique"
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content.replace(old_text, new_text, 1))
-        return f"edited {target} (replaced {len(old_text)} bytes with {len(new_text)})"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def run_list_dir(ctx: AgentContext, path: str = ".") -> str:
-    try:
-        target = resolve_agent_path(ctx, path)
-        entries = []
-        for name in sorted(os.listdir(target)):
-            full = os.path.join(target, name)
-            entries.append(f"{name}/" if os.path.isdir(full) else name)
-        return _truncate("\n".join(entries)) if entries else "(empty)"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-def run_search_files(ctx: AgentContext, pattern: str, path: str = ".", file_glob: str = "") -> str:
-    try:
-        import fnmatch
-        import re
-
-        root = resolve_agent_path(ctx, path)
-        regex = re.compile(pattern)
-        hits = []
-        scanned = 0
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS]
-            for name in sorted(filenames):
-                if file_glob and not fnmatch.fnmatch(name, file_glob):
-                    continue
-                scanned += 1
-                if scanned > SEARCH_MAX_FILES:
-                    hits.append(f"...[stopped after scanning {SEARCH_MAX_FILES} files]")
-                    return _truncate("\n".join(hits))
-                full = os.path.join(dirpath, name)
-                try:
-                    with open(full, "r", encoding="utf-8") as f:
-                        for lineno, line in enumerate(f, 1):
-                            if regex.search(line):
-                                hits.append(f"{os.path.relpath(full, root)}:{lineno}: {line.rstrip()}")
-                                if len(hits) >= SEARCH_MAX_MATCHES:
-                                    hits.append(f"...[stopped at {SEARCH_MAX_MATCHES} matches]")
-                                    return _truncate("\n".join(hits))
-                except (OSError, UnicodeDecodeError):
-                    continue  # binary or unreadable -- not what this tool is for
-        return _truncate("\n".join(hits)) if hits else "(no matches)"
-    except Exception as e:
-        return f"[error] {e}"
-
-
-async def execute_tool_call(ctx: AgentContext, name: str, args: dict) -> str:
-    if name == "bash":
-        return await run_bash(ctx, args.get("command", ""), args.get("cwd"))
-    if name == "read_file":
-        return run_read_file(ctx, args.get("path", ""))
-    if name == "write_file":
-        return run_write_file(ctx, args.get("path", ""), args.get("content", ""))
-    if name == "edit_file":
-        return run_edit_file(ctx, args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
-    if name == "list_dir":
-        return run_list_dir(ctx, args.get("path", "."))
-    if name == "search_files":
-        return run_search_files(ctx, args.get("pattern", ""), args.get("path", "."), args.get("file_glob", ""))
-    return f"[error] unknown tool '{name}'"
-
-
-def agent_system_prompt(ctx: AgentContext) -> str:
-    dirs = "\n".join(f"- {p}" + ("  (primary -- bash starts here)" if p == ctx.cwd else "") for p in ctx.roots)
-    if ctx.sandbox:
-        scope = ("The file tools refuse any path outside those directories. If you need "
-                 "something elsewhere, say so instead of trying to work around it.")
-    else:
-        scope = ("The sandbox is OFF for this session: the file tools can reach anywhere "
-                 "on this machine. Stay inside the directories above unless the user "
-                 "clearly asks otherwise, and never touch system files casually.")
-    return (
-        "You are an agent with real tool access to the machine hosting this proxy.\n\n"
-        f"Working directories:\n{dirs}\n\n"
-        f"{scope}\n\n"
-        "Use the tools to check things rather than guessing: read files before editing "
-        "them, and verify a change landed after making it. Prefer edit_file over "
-        "rewriting a whole file. When you're done, reply with a short plain-text summary "
-        "of what you did and what you found."
-    )
+MAX_AGENT_ITERATIONS = agent_tools.MAX_AGENT_ITERATIONS
 
 
 def pick_model(claude_model: str, backend: dict) -> str:
@@ -817,7 +444,7 @@ async def health():
     return {
         "status": "ok",
         "backends": [b["name"] for b in BACKENDS],
-        "agent_workspace": AGENT_WORKSPACE,
+        "agent_workspace": agent_tools.AGENT_WORKSPACE,
     }
 
 
@@ -909,17 +536,29 @@ async def reorder_backends(request: Request):
 async def ui_settings():
     """What the UI needs to describe agent mode. The toggles themselves are
     the browser's call -- nothing here gates them."""
+    usable = agent_tools.available_groups()
     return {
         "max_agent_iterations": MAX_AGENT_ITERATIONS,
-        "tool_timeout": AGENT_TOOL_TIMEOUT,
-        "default_workspace": AGENT_WORKSPACE,
-        "tools": [t["function"]["name"] for t in AGENT_TOOLS],
+        "round_ceiling": agent_tools.ROUND_CEILING,
+        "tool_timeout": agent_tools.AGENT_TOOL_TIMEOUT,
+        "default_workspace": agent_tools.AGENT_WORKSPACE,
+        "clone_root": agent_tools.CLONE_ROOT,
+        "groups": [
+            {
+                "name": group,
+                "available": usable.get(group, False),
+                "tools": [t["name"] for t in agent_tools.TOOLS if t["group"] == group],
+            }
+            for group in agent_tools.GROUPS
+        ],
+        "default_groups": agent_tools.DEFAULT_GROUPS,
+        "integrations": integrations.public(),
     }
 
 
 @app.get("/api/workdirs")
 async def list_workdirs():
-    return {"workdirs": [public_workdir(d) for d in WORKDIRS]}
+    return {"workdirs": [agent_tools.public_workdir(d) for d in agent_tools.WORKDIRS]}
 
 
 @app.post("/api/workdirs")
@@ -928,33 +567,166 @@ async def add_workdir(request: Request):
     raw = (body.get("path") or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="path is required")
-    path = norm_path(raw)
+    path = agent_tools.norm_path(raw)
     if not os.path.isdir(path):
         raise HTTPException(status_code=400, detail=f"'{path}' is not a directory on the proxy's machine")
-    if any(d["path"] == path for d in WORKDIRS):
+    if any(d["path"] == path for d in agent_tools.WORKDIRS):
         raise HTTPException(status_code=409, detail=f"'{path}' is already a working directory")
 
-    entry = {
-        "path": path,
-        "label": (body.get("label") or "").strip() or os.path.basename(path) or path,
-        "default": False,
-    }
-    WORKDIRS.append(entry)
-    save_workdirs()
-    return public_workdir(entry)
+    return agent_tools.public_workdir(
+        agent_tools.register_workdir(path, (body.get("label") or "").strip()))
 
 
 @app.delete("/api/workdirs")
 async def delete_workdir(path: str):
-    target = norm_path(path)
-    for i, d in enumerate(WORKDIRS):
+    target = agent_tools.norm_path(path)
+    for i, d in enumerate(agent_tools.WORKDIRS):
         if d["path"] == target:
             if d["default"]:
                 raise HTTPException(status_code=400, detail="the default workspace can't be removed")
-            del WORKDIRS[i]
-            save_workdirs()
+            del agent_tools.WORKDIRS[i]
+            agent_tools.save_workdirs()
             return {"ok": True}
     raise HTTPException(status_code=404, detail=f"'{target}' is not a registered working directory")
+
+
+# ---------------------------------------------------------------------------
+# Integrations: tokens for GitHub and web search. Secrets go in, only
+# "configured or not" comes back out.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/integrations")
+async def get_integrations():
+    return integrations.public()
+
+
+@app.put("/api/integrations")
+async def put_integrations(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected an object")
+    integrations.update(body)
+    return integrations.public()
+
+
+@app.post("/api/integrations/github/test")
+async def test_github():
+    """Verify the stored token and report who it belongs to, so the UI can
+    show 'connected as <login>' instead of just 'a token is set'."""
+    try:
+        user = await github_api.whoami()
+    except github_api.GitHubError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"login": user.get("login"), "name": user.get("name"), "url": user.get("html_url")}
+
+
+# ---------------------------------------------------------------------------
+# GitHub browsing for the UI itself (the agent has its own tools for this)
+# ---------------------------------------------------------------------------
+
+def _github_route(coro):
+    """GitHubError is a user-facing configuration problem, not a 500."""
+    async def wrapped():
+        try:
+            return await coro()
+        except github_api.GitHubError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return wrapped()
+
+
+@app.get("/api/github/repos")
+async def github_repos(query: str = "", limit: int = 30):
+    repos = await _github_route(lambda: github_api.list_repos(limit=limit, query=query))
+    return {"repos": [
+        {
+            "full_name": r.get("full_name"),
+            "description": r.get("description") or "",
+            "private": bool(r.get("private")),
+            "default_branch": r.get("default_branch", ""),
+            "pushed_at": r.get("pushed_at", ""),
+            "url": r.get("html_url", ""),
+        }
+        for r in repos
+    ]}
+
+
+@app.get("/api/github/pulls")
+async def github_pulls(repo: str, state: str = "open", limit: int = 20):
+    pulls = await _github_route(lambda: github_api.list_pulls(repo, state=state, limit=limit))
+    return {"pulls": [
+        {
+            "number": p["number"], "title": p["title"], "state": p["state"],
+            "user": p["user"]["login"], "head": p["head"]["ref"], "base": p["base"]["ref"],
+            "url": p["html_url"], "draft": bool(p.get("draft")),
+        }
+        for p in pulls
+    ]}
+
+
+@app.get("/api/github/issues")
+async def github_issues(repo: str, state: str = "open", limit: int = 20):
+    issues = await _github_route(lambda: github_api.list_issues(repo, state=state, limit=limit))
+    return {"issues": [
+        {
+            "number": i["number"], "title": i["title"], "state": i["state"],
+            "user": i["user"]["login"], "comments": i.get("comments", 0), "url": i["html_url"],
+        }
+        for i in issues
+    ]}
+
+
+@app.post("/api/github/clone")
+async def github_clone(request: Request):
+    """Clone a repo and register it as a working directory -- the same thing
+    the agent's github_clone tool does, exposed for the UI's repo list."""
+    body = await request.json()
+    repo = (body.get("repo") or "").strip()
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    ctx = agent_tools.build_agent_context(None, True, ["github"])
+    result = await agent_tools.run_github_clone(ctx, repo, (body.get("branch") or "").strip())
+    if result.startswith("[error]"):
+        raise HTTPException(status_code=400, detail=result.removeprefix("[error] "))
+    return {"message": result, "workdirs": [agent_tools.public_workdir(d) for d in agent_tools.WORKDIRS]}
+
+
+# ---------------------------------------------------------------------------
+# Saved sessions
+# ---------------------------------------------------------------------------
+
+@app.get("/api/sessions")
+async def get_sessions():
+    return {"sessions": sessions.list_sessions()}
+
+
+@app.post("/api/sessions")
+async def post_session(request: Request):
+    body = await request.json()
+    return sessions.create(**{k: v for k, v in body.items() if k in ("title", *sessions.UPDATABLE)})
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str):
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return session
+
+
+@app.patch("/api/sessions/{session_id}")
+async def patch_session(session_id: str, request: Request):
+    body = await request.json()
+    session = sessions.update(session_id, body)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return sessions.summary(session)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def remove_session(session_id: str):
+    if not sessions.delete(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True}
 
 
 @app.post("/api/probe-models")
@@ -1054,7 +826,7 @@ def sse_data(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-async def agent_loop_gen(chain, messages, started_on, ctx: AgentContext):
+async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentContext, max_rounds: int):
     """Agentic mode for the web UI only: lets the model call bash/file tools
     scoped to the session's working directories on this container, looping
     tool-call -> execute -> feed result back -> repeat until it answers with
@@ -1063,12 +835,14 @@ async def agent_loop_gen(chain, messages, started_on, ctx: AgentContext):
     yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd}})
     # The system prompt is rebuilt per message rather than kept in history, so
     # toggling the sandbox or changing directories takes effect immediately.
-    conv = [{"role": "system", "content": agent_system_prompt(ctx)}]
+    conv = [{"role": "system", "content": agent_tools.agent_system_prompt(ctx)}]
     conv += [m for m in messages if m.get("role") != "system"]
+    tools = agent_tools.tools_for(ctx)
+    seen = {}  # tool-call signature -> times requested, to break repeat loops
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        for _ in range(MAX_AGENT_ITERATIONS):
+        for _ in range(max_rounds):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
-                client, chain, conv, tools=AGENT_TOOLS)
+                client, chain, conv, tools=tools)
             if data is None:
                 prefix = f"HTTP {hard_status}" if hard_status else "all configured backends exhausted"
                 yield sse_data({"error": f"{prefix}: {error}"})
@@ -1098,11 +872,44 @@ async def agent_loop_gen(chain, messages, started_on, ctx: AgentContext):
                     args = {}
                 call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
                 yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
-                result = await execute_tool_call(ctx, name, args)
+
+                # Smaller models get stuck repeating one call forever. Answer
+                # the repeat with a nudge instead of running it again, so the
+                # round budget goes on actual work.
+                signature = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+                seen[signature] = seen.get(signature, 0) + 1
+                if seen[signature] > 2:
+                    result = ("[error] you have already run this exact call twice and the result "
+                              "has not changed. Stop repeating it -- either do something different "
+                              "or give your final answer now.")
+                else:
+                    result = await agent_tools.execute_tool_call(ctx, name, args)
                 yield sse_data({"agent_tool_result": {"id": call_id, "name": name, "output": result}})
                 conv.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                # github_clone can add a working directory mid-run; tell the UI
+                # so its directory list and scope chip stay honest.
+                if name == "github_clone" and not result.startswith("[error]"):
+                    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd},
+                                    "workdirs_changed": True})
 
-        yield sse_data({"error": f"stopped after {MAX_AGENT_ITERATIONS} tool iterations without a final answer"})
+        # Out of tool rounds. This is a pause, not a failure: ask once more
+        # with no tools attached so the model reports where it got to, then
+        # tell the UI it can offer to carry on. The conversation stays intact
+        # either way -- a long review picks up exactly where it stopped.
+        conv.append({
+            "role": "user",
+            "content": (f"You have used all {max_rounds} tool calls allowed for this message. "
+                        "Do not request any more. Summarise what you have found so far and state "
+                        "exactly what you were in the middle of, so you can pick it up next turn."),
+        })
+        data, _, _, _, _ = await call_chain_non_stream(client, chain, conv)
+        final = ""
+        if data is not None:
+            final = (data["choices"][0]["message"].get("content") or "").strip()
+        if final:
+            yield sse_data({"agent_text": final})
+        yield sse_data({"agent_limit": max_rounds})
+        yield sse_data({"agent_done": True})
 
 
 @app.post("/api/chat")
@@ -1122,8 +929,11 @@ async def ui_chat(request: Request):
     started_on = chain[0][0]["name"]
 
     if body.get("agent"):
-        ctx = build_agent_context(body.get("workdirs"), body.get("sandbox", True))
-        return StreamingResponse(agent_loop_gen(chain, messages, started_on, ctx), media_type="text/event-stream")
+        ctx = agent_tools.build_agent_context(
+            body.get("workdirs"), body.get("sandbox", True), body.get("groups"))
+        max_rounds = agent_tools.clamp_rounds(body.get("max_rounds"))
+        return StreamingResponse(agent_loop_gen(chain, messages, started_on, ctx, max_rounds),
+                                 media_type="text/event-stream")
 
     if stream:
         client = httpx.AsyncClient()

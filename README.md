@@ -5,12 +5,18 @@ translating between Anthropic's Messages API (what Claude Code speaks) and
 any OpenAI-compatible chat completions API -- with automatic failover
 across a list of backends.
 
-Everything the project needs is in this one repo -- `main.py`, a small
-static web UI, plus a handful of config/doc files. All state that's specific
-to your setup (API keys, which backends you use, which directories agent
-mode may touch) lives in `backends.json` and `workdirs.json`, which are
-created locally and gitignored -- they never get committed, so cloning this
-repo is safe to do publicly.
+Everything the project needs is in this one repo: the proxy (`main.py`), the
+agent layer (`agent_tools.py`, `git_tools.py`, `github_api.py`, `web_tools.py`),
+saved chats (`sessions.py`), credentials (`integrations.py`), and a static web
+UI. All state that's specific to your setup is created locally and gitignored,
+so cloning this repo is safe to do publicly:
+
+| file | holds |
+| --- | --- |
+| `backends.json` | provider URLs, models, API keys |
+| `workdirs.json` | directories agent mode may work in |
+| `integrations.json` | GitHub token, web-search key (written `chmod 600`) |
+| `sessions/` | saved chats |
 
 **What this actually is:** Claude Code stays Claude Code (the CLI/tool-use
 harness). The *model* answering prompts is whichever backend in
@@ -21,22 +27,28 @@ models.
 ## Web UI
 
 Once the proxy is running, open `http://127.0.0.1:8082/` (or wherever you
-bound it) in a browser. The window is a side panel (Backends / Agent /
-Activity) next to a chat pane, with the agent and sandbox switches sitting
+bound it) in a browser. The window is a side panel (Chats / Backends / Agent /
+GitHub) next to a chat pane, with the agent and sandbox switches sitting
 directly above the composer where you actually use them.
 
+- **Chats tab** -- every conversation is saved server-side under `sessions/`
+  and listed here: reopen, rename, or delete. Reopening replays the whole
+  transcript including tool calls and their output, not just the text, and
+  carries on with the same history. Chats survive a browser reload and a proxy
+  restart.
 - **Backends tab** -- pick a provider preset (or "Custom"), paste in its API
   key, hit "Detect models" to pull the real model list from that provider
   instead of typing model IDs by hand, and save. Reorder or remove backends
   with the arrows/× on each card. This edits `backends.json` for you -- no
-  need to hand-edit JSON or paste keys into a chat transcript.
-- **Agent tab** -- the working directories agent mode may operate in. Add any
-  directory on the proxy's machine by path, tick the ones a session should
-  see, remove the ones it shouldn't. The first ticked directory is the
-  "primary" one: it's where `bash` starts and what relative paths resolve
-  against. The list persists in `workdirs.json`.
-- **Activity tab** -- the proxy's recent backend attempts, so you can watch
-  failover happen instead of inferring it from `curl /status`.
+  need to hand-edit JSON or paste keys into a chat transcript. "Recent
+  attempts" at the bottom shows failover happening live.
+- **Agent tab** -- the tool-round budget, which tool groups the model may
+  call, the working directories it may operate in, and the web-search key.
+  See "Agent tools" below.
+- **GitHub tab** -- connect a token, browse your repositories, clone one onto
+  the proxy's machine with a single click (it's registered as a working
+  directory immediately), and read open PRs and issues. The **→** button on
+  any PR or issue drops a ready-made prompt into the composer.
 - **Chat** -- pick any configured backend + model and talk to it directly,
   with streaming responses (no Anthropic translation -- this is a human
   talking to a provider, separate from how Claude Code uses the proxy via
@@ -46,7 +58,6 @@ directly above the composer where you actually use them.
   note announces the switch -- the dropdowns update to match, so your next
   message starts there directly. **Send** becomes **Stop** while a reply is
   streaming.
-- **Agent tools / Sandbox switches** -- see "Agent tools" below.
 
 Everything here runs API keys through this local server only -- keys never
 leave the machine the proxy runs on except to reach the provider you picked.
@@ -248,11 +259,11 @@ Change the mapping in `backends.json`, not in code.
 
 ## Agent tools
 
-Lets the model in the web UI's chat actually run shell commands and
-read/write files on the machine hosting the proxy -- separate from Claude
-Code, which already has its own tools and is unaffected by any of this.
-Everything about it is controlled from the UI; there's no env var to set
-first and no restart needed.
+Lets the model in the web UI's chat actually work on the machine hosting the
+proxy: run commands, read and edit files, drive git, use GitHub, and fetch
+from the web -- separate from Claude Code, which has its own tools and is
+unaffected by any of this. Everything about it is controlled from the UI;
+there's no env var to set first and no restart needed.
 
 ### The two switches
 
@@ -278,23 +289,79 @@ live state, e.g. `agent · sandboxed · myproject +1`.
 Added directories are stored in `workdirs.json` (gitignored) and survive a
 restart. Ticking is per browser, not shared.
 
+### Tool groups
+
+Tools come in groups you tick in the Agent tab, so you can hand the model a
+shell without also handing it the ability to open pull requests:
+
+| group | tools |
+| --- | --- |
+| Shell | `bash` |
+| Files | `read_file`, `write_file`, `edit_file`, `list_dir`, `search_files` |
+| Git | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit`, `git_checkout`, `git_push` |
+| GitHub | `github_list_repos`, `github_clone`, `github_list_prs`, `github_read_pr`, `github_list_issues`, `github_read_issue` |
+| GitHub write | `github_create_issue`, `github_comment`, `github_create_pr` |
+| Web | `web_fetch`, `web_search` |
+
+Unticked groups aren't offered to the model at all, and are refused
+server-side if it invents a call anyway. **GitHub write is off by default** --
+those actions are publicly visible, so turning them on is a deliberate act.
+The GitHub groups only become available once a token is connected.
+
+### Tool rounds
+
+One message can make many tool calls; reviewing a real codebase is dozens of
+reads. The budget defaults to 100 rounds and is adjustable per browser in the
+Agent tab (up to 500).
+
+Running out **does not end the chat.** The model is asked once more with no
+tools attached, so it reports what it found and what it was mid-way through,
+and a **Continue** button appears to pick the work straight back up. Identical
+repeated tool calls don't consume the budget either -- the loop answers the
+third identical call with a nudge instead of running it again, which is what
+usually burns rounds on smaller models.
+
 ### Using it
 
 1. Pick a backend + model that supports tool/function calling (same
    requirement as everywhere else in this proxy).
-2. Turn on **Agent tools**. Add and tick whichever directories the job needs.
+2. Turn on **Agent tools**. Add and tick whichever directories the job needs,
+   and the groups it should be allowed to use.
 3. Ask for something that needs the machine, e.g. "read main.py and tell me
-   what the failover logic does", or "add a docstring to the top of
-   utils.py and show me the diff."
+   what the failover logic does", "clone octo/demo and summarise its layout",
+   or "review PR #7 in octo/demo."
 4. Watch the chat: assistant text, then a collapsible card per tool call
-   showing the arguments and the real output (click to expand; failures
-   open themselves), then the final answer once it stops calling tools.
-   After 12 rounds without a final answer the proxy stops and says so.
+   showing the arguments and the real output (click to expand; failures open
+   themselves), then the final answer once it stops calling tools.
 
-Six tools are available: `bash`, `read_file`, `write_file`, `edit_file`,
-`list_dir`, `search_files`. Each message re-sends the current directories
-and sandbox state, so flipping a switch takes effect on the very next
-message -- there's no session to restart.
+Each message re-sends the current directories, groups and sandbox state, so
+flipping a switch takes effect on the very next message -- there's no session
+to restart.
+
+## GitHub integration
+
+Connect a personal access token (Settings → Developer settings → Personal
+access tokens, `repo` scope) in the **GitHub** tab. It's stored in
+`integrations.json` on the proxy's machine with `chmod 600`, is never sent to
+a model, never appears in a chat transcript, and is never shown back in the UI
+-- the API only ever reports whether one is configured.
+
+With a token connected:
+
+- The GitHub tab lists your repositories, and **↓** clones one into
+  `AGENT_CLONE_ROOT` (default `workspace/repos`) and registers it as a working
+  directory, so the file and git tools can work on it right away.
+- The agent's `github_clone` tool does the same thing mid-conversation, and
+  adds the clone to the current run's scope so it can keep going without you
+  ticking a box.
+- Cloning authenticates with a per-command HTTP header rather than embedding
+  the token in the remote URL, so **the token never lands in `.git/config`**.
+  Pushes authenticate the same way.
+- `GITHUB_API` defaults to `https://api.github.com`; point it at a GitHub
+  Enterprise host and the clone URL follows automatically.
+
+Web search is separate: paste a Brave or Tavily key in the Agent tab to enable
+`web_search`. `web_fetch` works without any key.
 
 **The real safety boundary is the machine itself, not the sandbox switch.**
 Even sandboxed, `bash` can `cd` elsewhere or use absolute paths -- the
