@@ -156,3 +156,29 @@ async def test_call_chain_non_stream_reports_which_backend_answered(app):
     assert used_backend == "secondary"
     assert used_model == "secondary-big"
     assert hard is None
+
+
+async def test_a_200_with_a_non_json_body_moves_on(app):
+    """A gateway's HTML error page, or a backend answering SSE to a
+    non-streaming request. resp.json() on that used to be a 500."""
+    handler = by_host({
+        "primary.test": httpx.Response(200, text="<html>502 Bad Gateway</html>"),
+        "secondary.test": completion("from secondary"),
+    })
+    async with mock_client(handler) as client:
+        data, err = await main.try_backends_non_stream(client, {"model": "m", "messages": []})
+    assert data["choices"][0]["message"]["content"] == "from secondary"
+    assert any("not JSON" in e["outcome"] for e in main.ATTEMPT_LOG)
+
+
+async def test_the_ui_chain_also_survives_a_non_json_body(app):
+    handler = by_host({
+        "primary.test": httpx.Response(200, text="not json at all"),
+        "secondary.test": completion("from secondary"),
+    })
+    chain = main.chat_fallback_chain("primary", "primary-big")
+    async with mock_client(handler) as client:
+        data, used_backend, used_model, error, hard = await main.call_chain_non_stream(
+            client, chain, [{"role": "user", "content": "hi"}])
+    assert used_backend == "secondary"
+    assert hard is None

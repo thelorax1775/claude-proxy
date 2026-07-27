@@ -13,6 +13,7 @@ import collections
 import json
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -89,6 +90,56 @@ def upstream_client(timeout=HTTP_TIMEOUT) -> httpx.AsyncClient:
 # Status codes worth failing over on. 401/403 included because a dead/expired
 # free-tier key should not take the whole proxy down -- skip to the next one.
 RETRYABLE_STATUS = {401, 403, 429, 500, 502, 503, 504}
+
+
+# ---------------------------------------------------------------------------
+# Context overflow.
+#
+# A conversation that outgrows a model's context window comes back as a 400,
+# which is otherwise the shape of "your request is malformed" -- not worth
+# retrying, because the next backend would say the same. Context is the
+# exception: the whole point of a chain is that its backends differ, and they
+# differ in context window as much as anything else. A conversation too long
+# for an 8k model is ordinary for a 128k one, so this is worth failing over
+# on rather than dead-ending the chat.
+#
+# There is no standard code for it. Every provider says it in prose, so this
+# matches the prose; a false negative just restores the old behaviour of
+# passing the 400 through.
+# ---------------------------------------------------------------------------
+
+CONTEXT_OVERFLOW_STATUS = {400, 413, 422}
+
+CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[ _-]?length|context[ _-]?window|maximum context|"
+    r"context_length_exceeded|string_above_max_length|"
+    r"too many tokens|reduce the length|too long|"
+    r"exceeds?\b[^.]{0,40}\btokens?\b|"
+    r"\btokens?\b[^.]{0,40}\bexceed",
+    re.I,
+)
+
+
+def is_context_overflow(status: int, body: str) -> bool:
+    """Whether an upstream rejection means "this conversation no longer fits"
+    rather than "this request is wrong"."""
+    if status not in CONTEXT_OVERFLOW_STATUS:
+        return False
+    return bool(CONTEXT_OVERFLOW_RE.search(body or ""))
+
+
+# What the UI shows when no backend would take the conversation. The chat is
+# not broken and the history is not lost -- it just has to get shorter, and
+# the browser offers to do that.
+CONTEXT_OVERFLOW_MESSAGE = (
+    "This conversation is now too long for every configured backend. "
+    "Shorten it (or start a new chat) and the same backends will work again."
+)
+
+# Sentinel in call_chain_non_stream's hard_status position. Not an HTTP status:
+# it says "every backend refused this as too long", which callers handle
+# differently from an upstream status they should pass through.
+OVERFLOW = "context_overflow"
 
 
 def record_attempt(backend_name: str, outcome: str):
@@ -453,6 +504,7 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
     (response, backend) for the first one that isn't rate-limited/erroring,
     or (None, None) if all backends were exhausted."""
     last_error = None
+    overflowed = False
     # Snapshot: this loop spans awaits, and deleting or reordering a backend
     # from the UI mid-request would otherwise silently skip the next entry.
     for backend in usable_backends(list(BACKENDS), lambda b: b["name"]):
@@ -477,17 +529,36 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
         if resp.status_code >= 400:
             body_text = (await resp.aread()).decode("utf-8", "replace")
             await resp.aclose()
+            if is_context_overflow(resp.status_code, body_text):
+                # Not this backend's fault and not a reason to bench it -- the
+                # next message may well be short. Try one with a bigger window.
+                record_attempt(backend["name"], "context overflow")
+                overflowed = True
+                last_error = f"HTTP {resp.status_code}: {body_text[:300]}"
+                continue
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, None, f"HTTP {resp.status_code}: {body_text[:300]}"
         record_attempt(backend["name"], "ok")
         clear_cooldown(backend["name"])
         return resp, backend, None
+    if overflowed:
+        return None, None, OVERFLOW
     return None, None, last_error or "no backends configured"
 
 
 async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, claude_model: str):
     resp, backend, error = await find_working_stream(client, body)
     if resp is None:
+        if error == OVERFLOW:
+            # invalid_request_error, not api_error: this is what Anthropic
+            # returns for an over-long prompt, and it's what Claude Code reads
+            # to decide to compact and retry rather than surface a failure.
+            yield sse_event("error", {
+                "type": "error",
+                "error": {"type": "invalid_request_error",
+                          "message": "prompt is too long: " + CONTEXT_OVERFLOW_MESSAGE},
+            })
+            return
         yield sse_event("error", {
             "type": "error",
             "error": {"type": "api_error", "message": f"all backends exhausted: {error}"},
@@ -1206,6 +1277,7 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
     upstream error -- callers should pass that straight through rather than
     treat it as the whole chain being exhausted."""
     last_error = None
+    overflowed = False
     for backend, model in usable_backends(chain, lambda pair: pair[0]["name"]):
         payload = {"model": model, "messages": messages, "stream": False}
         if tools:
@@ -1224,11 +1296,28 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
             last_error = f"HTTP {resp.status_code}"
             continue
         if resp.status_code >= 400:
+            if is_context_overflow(resp.status_code, resp.text):
+                record_attempt(backend["name"], "context overflow")
+                overflowed = True
+                last_error = f"HTTP {resp.status_code}"
+                continue
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, None, None, resp.text, resp.status_code
+        try:
+            data = resp.json()
+        except ValueError:
+            # See try_backends_non_stream: a 200 with an unparseable body is
+            # an unusable answer, not a reason to 500.
+            record_attempt(backend["name"], "200 but the body was not JSON")
+            last_error = f"{backend['name']} returned a non-JSON body"
+            continue
         record_attempt(backend["name"], "ok")
         clear_cooldown(backend["name"])
-        return resp.json(), backend["name"], model, None, None
+        return data, backend["name"], model, None, None
+    if overflowed:
+        # OVERFLOW rather than a status, so the caller can tell the browser
+        # what kind of failure this is and offer the one thing that fixes it.
+        return None, None, None, CONTEXT_OVERFLOW_MESSAGE, OVERFLOW
     return None, None, None, last_error or "no backends configured", None
 
 
@@ -1280,10 +1369,17 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
                 client, chain, conv, tools=tools)
             if data is None:
-                prefix = f"HTTP {hard_status}" if hard_status else "all configured backends exhausted"
                 # Whatever tool work already happened is still worth keeping --
                 # the next message shouldn't start over because one call failed.
                 yield sse_data({"agent_history": conv[base_len:]})
+                if hard_status == OVERFLOW:
+                    # An agent run is the likeliest thing to outgrow a context
+                    # window: every tool result is appended verbatim. Say so as
+                    # itself, so the browser can offer to shorten instead of
+                    # showing a provider's raw complaint.
+                    yield sse_data({"error": error, "error_kind": OVERFLOW})
+                    return
+                prefix = f"HTTP {hard_status}" if hard_status else "all configured backends exhausted"
                 yield sse_data({"error": f"{prefix}: {error}"})
                 return
             if used_backend != started_on:
@@ -1463,6 +1559,7 @@ async def ui_chat(request: Request):
         client = upstream_client()
 
         async def gen():
+            overflowed = False
             try:
                 for backend, model in usable_backends(chain, lambda pair: pair[0]["name"]):
                     payload = {"model": model, "messages": messages, "stream": True}
@@ -1482,6 +1579,10 @@ async def ui_chat(request: Request):
                     if resp.status_code >= 400:
                         err = (await resp.aread()).decode("utf-8", "replace")
                         await resp.aclose()
+                        if is_context_overflow(resp.status_code, err):
+                            record_attempt(backend["name"], "context overflow")
+                            overflowed = True
+                            continue
                         yield f"data: {json.dumps({'error': err})}\n\n"
                         return
                     record_attempt(backend["name"], "ok")
@@ -1494,7 +1595,10 @@ async def ui_chat(request: Request):
                     finally:
                         await resp.aclose()
                     return
-                yield f"data: {json.dumps({'error': 'all configured backends exhausted'})}\n\n"
+                if overflowed:
+                    yield sse_data({"error": CONTEXT_OVERFLOW_MESSAGE, "error_kind": OVERFLOW})
+                else:
+                    yield f"data: {json.dumps({'error': 'all configured backends exhausted'})}\n\n"
             finally:
                 await client.aclose()
 
@@ -1503,6 +1607,9 @@ async def ui_chat(request: Request):
     async with upstream_client() as client:
         data, used_backend, used_model, error, hard_status = await call_chain_non_stream(client, chain, messages)
         if data is None:
+            if hard_status == OVERFLOW:
+                return JSONResponse(status_code=413,
+                                    content={"error": error, "error_kind": OVERFLOW})
             if hard_status:
                 return JSONResponse(status_code=hard_status, content={"error": error})
             raise HTTPException(status_code=502, detail=f"all configured backends exhausted: {error}")
@@ -1538,6 +1645,7 @@ async def count_tokens(request: Request):
 
 async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
     last_error = None
+    overflow_resp = None
     # snapshot + cooldown filter -- see find_working_stream
     for backend in usable_backends(list(BACKENDS), lambda b: b["name"]):
         payload = build_openai_payload(body, backend)
@@ -1555,11 +1663,31 @@ async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
             last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
             continue
         if resp.status_code >= 400:
+            if is_context_overflow(resp.status_code, resp.text):
+                # A backend with a bigger window may still take it.
+                record_attempt(backend["name"], "context overflow")
+                overflow_resp = resp
+                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                continue
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, resp
+        try:
+            data = resp.json()
+        except ValueError:
+            # A 200 whose body isn't JSON: a gateway's HTML error page, or a
+            # backend answering SSE to a non-streaming request. Treat it like
+            # any other unusable answer and try the next one.
+            record_attempt(backend["name"], "200 but the body was not JSON")
+            last_error = f"{backend['name']} returned a non-JSON body"
+            continue
         record_attempt(backend["name"], "ok")
         clear_cooldown(backend["name"])
-        return resp.json(), None
+        return data, None
+    if overflow_resp is not None:
+        # Hand the overflow back as itself rather than as "all backends
+        # exhausted": Claude Code knows what to do with a context error (it
+        # compacts and retries), and can do nothing with a 502.
+        return None, overflow_resp
     raise HTTPException(status_code=502, detail=f"all backends exhausted: {last_error}")
 
 

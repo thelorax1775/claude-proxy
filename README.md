@@ -164,6 +164,10 @@ silently vanishes from the chain. The two durations are `BACKEND_COOLDOWN` and
 Cooling can never empty the chain: if every backend is benched they're all
 tried anyway. An answer from an over-quota account beats no answer.
 
+A conversation that no longer fits a model's context window also falls through
+to the next backend, since window sizes differ -- see
+[When a conversation gets too long](#when-a-conversation-gets-too-long).
+
 Watch it happen live in the **Backends** tab, or:
 
 ```bash
@@ -249,6 +253,33 @@ next to a chat pane, with the mode switches directly above the composer.
 
 API keys run through this local server only -- they never leave the machine
 the proxy runs on except to reach the provider you picked.
+
+### When a conversation gets too long
+
+Every model has a context window, and a long chat -- especially an agent run,
+where each tool result is appended verbatim -- eventually exceeds it. The
+provider answers `400`, which is otherwise the shape of "your request is
+malformed": not worth retrying, because the next backend would say the same.
+
+Context is the exception, so it gets treated as its own thing:
+
+- **It fails over.** Backends differ in context window as much as in anything
+  else, and a conversation too long for an 8k model is ordinary for a 128k
+  one. Put a big-window backend in the chain and long chats simply carry on
+  there. The attempt shows as `context overflow` in the Backends tab.
+- **It doesn't bench the backend.** Unlike a rate limit, this says nothing
+  about the account -- the next message may well be short, so the backend
+  stays in the chain.
+- **If nothing will take it, the chat still isn't stuck.** You get an offer to
+  **drop the older half and retry** rather than a provider's raw complaint.
+  That trims what the *model* sees, always on a whole-exchange boundary so a
+  tool result never gets separated from the call it answers. The transcript on
+  screen keeps everything, and nothing is written to `sessions/` that wasn't
+  already there.
+
+For Claude Code the proxy passes the provider's own context error through
+(`invalid_request_error`, "prompt is too long") rather than a generic failure,
+which is what Claude Code reads to decide to compact and retry by itself.
 
 ### No auth, by design
 
@@ -721,6 +752,9 @@ in which case it uses that backend's stored key.
 - `output_tokens` on a streamed response is the provider's own count when it
   volunteers one, and the same `len/4` estimate otherwise. `input_tokens` on
   `message_start` is still reported as 0.
+- Trimming an over-long conversation is manual and blunt -- a button that
+  drops the older half. There's no summarising or token-aware trimming, so
+  what it drops is gone from the model's view for the rest of the chat.
 - Failover only happens *before* a streaming response starts sending to
   Claude Code. If a backend dies mid-stream after already answering, that turn
   errors out rather than silently jumping to the next backend -- Claude Code

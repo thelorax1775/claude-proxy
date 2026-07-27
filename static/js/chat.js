@@ -10,6 +10,10 @@ import { selectedPaths } from "./workdirs.js";
 import { selectedGroups, maxRounds } from "./groups.js";
 import { ensureSession, saveCurrent, newSession } from "./sessions.js";
 
+// Matches main.OVERFLOW: the server says which failures are "too long" rather
+// than "broken", because only that one has an action attached.
+const OVERFLOW = "context_overflow";
+
 let inFlight = null;
 // What the last agent run was scoped to, so the scope notice only shows up
 // when it actually changes rather than above every single message.
@@ -313,10 +317,64 @@ function setBusy(busy) {
 // sending
 // ---------------------------------------------------------------------------
 
-async function sendMessage() {
+/** Every index in the history where a fresh exchange begins.
+ *
+ *  A role:"user" message is always a turn boundary -- tool results are
+ *  role:"tool", never "user" -- so cutting immediately before one can never
+ *  strand a tool result whose tool_call the assistant message announced. That
+ *  pairing is exactly what a naive "drop the first N messages" would break,
+ *  and providers reject the result. */
+function turnStarts(history) {
+  return history.reduce((acc, m, i) => (m.role === "user" ? acc.concat(i) : acc), []);
+}
+
+/** Drop roughly the older half of the conversation, on a turn boundary.
+ *  Returns the number of messages dropped, or 0 if there was nothing safe to
+ *  drop (a single exchange that doesn't fit can only be started over). */
+function shortenHistory() {
+  const starts = turnStarts(store.history);
+  if (starts.length <= 1) return 0;
+  // Never drop the final turn: that's the message the user is waiting on.
+  const cut = starts[Math.min(Math.max(1, Math.floor(starts.length / 2)), starts.length - 1)];
+  store.history.splice(0, cut);
+  return cut;
+}
+
+/** Shown when no backend would take the conversation. This is the one error
+ *  the user can actually act on, and the action is mechanical, so offer to do
+ *  it rather than describing it. */
+function addOverflowNotice(message, retry) {
+  clearEmptyState();
+  const droppable = turnStarts(store.history).length > 1;
+  const wrap = document.createElement("div");
+  wrap.className = "msg notice continue-notice";
+  wrap.innerHTML = `<div class="body"></div>`;
+  const body = wrap.querySelector(".body");
+  body.textContent = `${message} `;
+  if (droppable) {
+    const button = document.createElement("button");
+    button.className = "ghost-btn small";
+    button.textContent = "Drop the older half and retry";
+    button.onclick = () => {
+      const dropped = shortenHistory();
+      wrap.remove();
+      addNotice(`Dropped the oldest ${dropped} message(s) from what the model sees. `
+                + `They're still in the transcript above.`);
+      retry();
+    };
+    body.appendChild(button);
+  } else {
+    body.textContent += "This single exchange is too big on its own, so there is "
+      + "nothing older to drop — start a new chat.";
+  }
+  messagesEl().appendChild(wrap);
+  scrollDown();
+}
+
+async function sendMessage({ resend = false } = {}) {
   const input = $("composer-input");
-  const text = input.value.trim();
-  if (!text) return;
+  const text = resend ? "" : input.value.trim();
+  if (!resend && !text) return;
 
   const backend = $("chat-backend").value;
   const model = $("chat-model").value;
@@ -334,12 +392,19 @@ async function sendMessage() {
   const approval = approvalMode();
   const groups = selectedGroups();
 
-  input.value = "";
-  autoGrow(input);
-  store.history.push({ role: "user", content: text });
-  record({ t: "user", text });
-  addMessage("user", text);
-  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups, lan, approval));
+  // A resend replays the history as it stands -- the user's message is
+  // already in it, and re-adding it would both duplicate the bubble and make
+  // the conversation longer, which is the opposite of what a retry after an
+  // overflow needs to do.
+  if (!resend) {
+    input.value = "";
+    autoGrow(input);
+    store.history.push({ role: "user", content: text });
+    record({ t: "user", text });
+    addMessage("user", text);
+  }
+  await ensureSession(text || "(retry)",
+                      sessionState(backend, model, agent, sandbox, groups, lan, approval));
 
   // Plain chat streams tokens into one bubble; agent mode emits whole
   // rounds, so its bubbles are created as events arrive.
@@ -349,6 +414,7 @@ async function sendMessage() {
   const agentTexts = [];
   let streamed = "";
   let errorText = "";
+  let overflow = "";
   let hitLimit = 0;
   // What an agent run actually added to the model-facing conversation: the
   // assistant's tool calls and every tool result, not just the text. Without
@@ -383,13 +449,15 @@ async function sendMessage() {
     if (!resp.ok || !resp.body) {
       const data = await resp.json().catch(() => ({}));
       const message = data.detail || data.error || `HTTP ${resp.status}`;
-      if (liveBody) {
-        liveBody.classList.remove("cursor");
-        liveBody.closest(".msg").classList.add("is-error");
-        liveBody.innerHTML = renderRich(message);
-      } else {
-        addMessage("assistant", message, { error: true });
+      if (liveBody) liveBody.closest(".msg").remove();
+      if (data.error_kind === OVERFLOW) {
+        // Deliberately no settle(): recording the failure as an assistant turn
+        // would make the conversation longer, which is what just failed.
+        record({ t: "notice", text: message });
+        addOverflowNotice(message, () => sendMessage({ resend: true }));
+        return;
       }
+      addMessage("assistant", message, { error: true });
       record({ t: "assistant", text: message, error: true });
       settle(message);
       return;
@@ -481,6 +549,10 @@ async function sendMessage() {
       if (chunk.agent_done) continue;
 
       if (chunk.error) {
+        if (chunk.error_kind === OVERFLOW) {
+          overflow = chunk.error;
+          continue;
+        }
         errorText = chunk.error;
         addMessage("assistant", chunk.error, { error: true });
         record({ t: "assistant", text: chunk.error, error: true });
@@ -509,6 +581,15 @@ async function sendMessage() {
       else if (errorText) settle(errorText);
     }
     if (!agent && streamed) record({ t: "assistant", text: streamed });
+    if (overflow) {
+      // No settle() -- see the same note on the non-streaming path. Whatever
+      // tool work the run got through stays in the history above; only the
+      // failure itself is left out, because recording it would grow the
+      // conversation that just proved too big.
+      if (liveBody && !streamed) liveBody.closest(".msg").remove();
+      record({ t: "notice", text: overflow });
+      addOverflowNotice(overflow, () => sendMessage({ resend: true }));
+    }
     if (hitLimit) addContinue(hitLimit);
   } catch (err) {
     if (err.name === "AbortError") {
