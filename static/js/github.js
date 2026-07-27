@@ -131,7 +131,7 @@ function section(heading, items) {
         <span class="title">${escapeHtml(shorten(item.title, 60))}</span>
         <span class="actions">
           <button class="icon-btn" data-ask="${escapeHtml(item.ask)}" title="Ask the model about this">&rarr;</button>
-          <a class="icon-btn" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer" title="Open on GitHub">&#8599;</a>
+          ${item.url ? `<a class="icon-btn" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer" title="Open on GitHub">&#8599;</a>` : ""}
         </span>
       </div>
       <div class="sub plain">${escapeHtml(item.sub)}</div>

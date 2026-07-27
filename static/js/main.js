@@ -100,4 +100,8 @@ loadAll().then(() => {
   initGroups();
   initGithub();
   loadActivity();
+  // initShell() picked the remembered tab before any of this existed, so if
+  // that tab was GitHub its repo list was skipped -- the token wasn't loaded
+  // yet, so it looked disconnected. Now that it is, fill it in.
+  if (prefs.get("tab", "chats") === "github") loadRepos();
 });

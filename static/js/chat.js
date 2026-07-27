@@ -254,8 +254,19 @@ async function sendMessage() {
   const toolCards = new Map();
   const agentTexts = [];
   let streamed = "";
-  let sawError = false;
+  let errorText = "";
   let hitLimit = 0;
+  // What an agent run actually added to the model-facing conversation: the
+  // assistant's tool calls and every tool result, not just the text. Without
+  // it, Continue resumes with a summary and the model redoes all the work.
+  let agentHistory = null;
+
+  /** Nothing usable came back. The user's message is on screen and in the
+   *  saved transcript, so it has to stay in the model-facing history too --
+   *  silently dropping it is what makes the two diverge, and the next message
+   *  then refers to a question the model was never shown. Record what
+   *  happened as the assistant turn instead. */
+  const settle = (reason) => store.history.push({ role: "assistant", content: reason });
 
   inFlight = new AbortController();
   setBusy(true);
@@ -284,7 +295,7 @@ async function sendMessage() {
         addMessage("assistant", message, { error: true });
       }
       record({ t: "assistant", text: message, error: true });
-      store.history.pop();
+      settle(message);
       return;
     }
 
@@ -336,6 +347,11 @@ async function sendMessage() {
         continue;
       }
 
+      if (chunk.agent_history) {
+        agentHistory = chunk.agent_history;
+        continue;
+      }
+
       if (chunk.agent_limit) {
         hitLimit = chunk.agent_limit;
         continue;
@@ -344,7 +360,7 @@ async function sendMessage() {
       if (chunk.agent_done) continue;
 
       if (chunk.error) {
-        sawError = true;
+        errorText = chunk.error;
         addMessage("assistant", chunk.error, { error: true });
         record({ t: "assistant", text: chunk.error, error: true });
         continue;
@@ -361,25 +377,35 @@ async function sendMessage() {
       }
     }
 
-    const finalText = agent ? agentTexts.join("\n\n") : streamed;
-    if (finalText) store.history.push({ role: "assistant", content: finalText });
-    else if (sawError) store.history.pop();
+    if (agentHistory) {
+      // The whole run: assistant turns, tool calls, tool results. Continue
+      // (and any later message) then carries on from the work itself.
+      store.history.push(...agentHistory);
+      if (errorText) settle(errorText);
+    } else {
+      const finalText = agent ? agentTexts.join("\n\n") : streamed;
+      if (finalText) store.history.push({ role: "assistant", content: finalText });
+      else if (errorText) settle(errorText);
+    }
     if (!agent && streamed) record({ t: "assistant", text: streamed });
     if (hitLimit) addContinue(hitLimit);
   } catch (err) {
     if (err.name === "AbortError") {
       addNotice("Stopped.");
       record({ t: "notice", text: "Stopped." });
-      if (streamed) {
-        store.history.push({ role: "assistant", content: streamed });
-        record({ t: "assistant", text: streamed });
+      // Whatever the model managed to say before Stop -- in agent mode that's
+      // the round texts, since nothing streams as deltas there.
+      const partial = agent ? agentTexts.join("\n\n") : streamed;
+      if (partial) {
+        store.history.push({ role: "assistant", content: partial });
+        if (!agent) record({ t: "assistant", text: partial });
       } else {
-        store.history.pop();
+        settle("(stopped by the user before I replied)");
       }
     } else {
       addMessage("assistant", err.message, { error: true });
       record({ t: "assistant", text: err.message, error: true });
-      store.history.pop();
+      settle(err.message);
     }
   } finally {
     if (liveBody) liveBody.classList.remove("cursor");

@@ -634,6 +634,17 @@ def _github_route(coro):
     return wrapped()
 
 
+def _login(item: dict) -> str:
+    """GitHub sends "user": null for anything authored by a deleted account.
+    One of those in a listing must not take the whole listing down."""
+    user = item.get("user")
+    return (user or {}).get("login", "") or "(unknown)"
+
+
+def _ref(item: dict, side: str) -> str:
+    return ((item.get(side) or {}).get("ref")) or ""
+
+
 @app.get("/api/github/repos")
 async def github_repos(query: str = "", limit: int = 30):
     repos = await _github_route(lambda: github_api.list_repos(limit=limit, query=query))
@@ -655,9 +666,9 @@ async def github_pulls(repo: str, state: str = "open", limit: int = 20):
     pulls = await _github_route(lambda: github_api.list_pulls(repo, state=state, limit=limit))
     return {"pulls": [
         {
-            "number": p["number"], "title": p["title"], "state": p["state"],
-            "user": p["user"]["login"], "head": p["head"]["ref"], "base": p["base"]["ref"],
-            "url": p["html_url"], "draft": bool(p.get("draft")),
+            "number": p.get("number"), "title": p.get("title") or "", "state": p.get("state") or "",
+            "user": _login(p), "head": _ref(p, "head"), "base": _ref(p, "base"),
+            "url": p.get("html_url") or "", "draft": bool(p.get("draft")),
         }
         for p in pulls
     ]}
@@ -668,8 +679,8 @@ async def github_issues(repo: str, state: str = "open", limit: int = 20):
     issues = await _github_route(lambda: github_api.list_issues(repo, state=state, limit=limit))
     return {"issues": [
         {
-            "number": i["number"], "title": i["title"], "state": i["state"],
-            "user": i["user"]["login"], "comments": i.get("comments", 0), "url": i["html_url"],
+            "number": i.get("number"), "title": i.get("title") or "", "state": i.get("state") or "",
+            "user": _login(i), "comments": i.get("comments", 0), "url": i.get("html_url") or "",
         }
         for i in issues
     ]}
@@ -837,14 +848,24 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     # toggling the sandbox or changing directories takes effect immediately.
     conv = [{"role": "system", "content": agent_tools.agent_system_prompt(ctx)}]
     conv += [m for m in messages if m.get("role") != "system"]
+    # Everything from here on is what this run adds; it goes back to the
+    # browser at the end so Continue resumes with the work, not just a summary.
+    base_len = len(conv)
     tools = agent_tools.tools_for(ctx)
-    seen = {}  # tool-call signature -> times requested, to break repeat loops
+    # Signature of the call the model is currently repeating, and how many
+    # times in a row. Only an unbroken run of identical calls is a stuck loop:
+    # anything else in between (a write, a different read) can change what the
+    # call would return, so the count starts over.
+    repeated, repeats = "", 0
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for _ in range(max_rounds):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
                 client, chain, conv, tools=tools)
             if data is None:
                 prefix = f"HTTP {hard_status}" if hard_status else "all configured backends exhausted"
+                # Whatever tool work already happened is still worth keeping --
+                # the next message shouldn't start over because one call failed.
+                yield sse_data({"agent_history": conv[base_len:]})
                 yield sse_data({"error": f"{prefix}: {error}"})
                 return
             if used_backend != started_on:
@@ -860,6 +881,9 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 yield sse_data({"agent_text": text})
 
             if not tool_calls:
+                if text:
+                    conv.append({"role": "assistant", "content": text})
+                yield sse_data({"agent_history": conv[base_len:]})
                 yield sse_data({"agent_done": True})
                 return
 
@@ -874,14 +898,16 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
 
                 # Smaller models get stuck repeating one call forever. Answer
-                # the repeat with a nudge instead of running it again, so the
-                # round budget goes on actual work.
+                # the third identical call in a row with a nudge instead of
+                # running it again, so the round budget goes on actual work.
                 signature = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
-                seen[signature] = seen.get(signature, 0) + 1
-                if seen[signature] > 2:
-                    result = ("[error] you have already run this exact call twice and the result "
-                              "has not changed. Stop repeating it -- either do something different "
-                              "or give your final answer now.")
+                repeats = repeats + 1 if signature == repeated else 1
+                repeated = signature
+                if repeats > 2:
+                    result = (f"[error] this is the same call, with the same arguments, "
+                              f"{repeats} times in a row with nothing in between. Repeating it "
+                              "is not making progress -- do something different, or give your "
+                              "final answer now.")
                 else:
                     result = await agent_tools.execute_tool_call(ctx, name, args)
                 yield sse_data({"agent_tool_result": {"id": call_id, "name": name, "output": result}})
@@ -907,7 +933,9 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
         if data is not None:
             final = (data["choices"][0]["message"].get("content") or "").strip()
         if final:
+            conv.append({"role": "assistant", "content": final})
             yield sse_data({"agent_text": final})
+        yield sse_data({"agent_history": conv[base_len:]})
         yield sse_data({"agent_limit": max_rounds})
         yield sse_data({"agent_done": True})
 

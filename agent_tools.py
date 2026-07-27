@@ -11,11 +11,11 @@ untouched by any of this.
 """
 
 import asyncio
-import fnmatch
 import json
 import logging
 import os
 import re
+import sys
 
 import git_tools
 import github_api
@@ -60,10 +60,12 @@ def clamp_rounds(requested) -> int:
         return MAX_AGENT_ITERATIONS
     return max(1, min(value, ROUND_CEILING))
 
-# Directories never worth walking into during a search.
-SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
-SEARCH_MAX_MATCHES = 200
-SEARCH_MAX_FILES = 5000
+# search_files is the one file tool that can run long -- the model picks both
+# the tree and the regex -- so it runs as a child process on the same budget
+# as a shell command. What it walks and how many hits it returns is
+# file_search.py's business.
+SEARCH_TIMEOUT = AGENT_TOOL_TIMEOUT
+SEARCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_search.py")
 
 GROUPS = ["shell", "files", "git", "github", "github_write", "web"]
 # Everything except the group that can post to other people's repositories.
@@ -201,10 +203,12 @@ def build_agent_context(requested_paths, sandbox_requested: bool, requested_grou
         roots = [AGENT_WORKSPACE]
 
     usable = available_groups()
+    # Only an absent/malformed selection falls back to the defaults. An
+    # explicit empty list means "no tools", and a selection whose groups are
+    # all unavailable means "nothing usable" -- neither may quietly turn into
+    # a shell. The run just has no tools to offer, which is a plain chat.
     asked = requested_groups if isinstance(requested_groups, list) else DEFAULT_GROUPS
     groups = [g for g in GROUPS if g in asked and usable.get(g)]
-    if not groups:
-        groups = [g for g in ("shell", "files") if usable.get(g)]
 
     return AgentContext(roots, bool(sandbox_requested), groups)
 
@@ -224,6 +228,24 @@ def resolve_agent_path(ctx: AgentContext, path: str) -> str:
 # shell + files
 # ---------------------------------------------------------------------------
 
+async def _stop_process(proc):
+    """Kill a child that is still running and reap it. Used on both exits that
+    aren't a clean finish -- the timeout, and the run being cancelled because
+    the user pressed Stop -- so neither leaves the command executing behind a
+    UI that says it stopped, nor a zombie behind the loop."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # it exited between the check and the signal
+    try:
+        # Shielded: on the cancellation path the await would otherwise be
+        # cancelled again immediately, before the child is collected.
+        await asyncio.shield(proc.wait())
+    except BaseException:
+        pass
+
+
 async def run_bash(ctx, command: str, cwd: str = "") -> str:
     try:
         workdir = resolve_agent_path(ctx, cwd) if cwd else ctx.cwd
@@ -236,8 +258,13 @@ async def run_bash(ctx, command: str, cwd: str = "") -> str:
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TOOL_TIMEOUT)
         except asyncio.TimeoutError:
-            proc.kill()
+            await _stop_process(proc)
             return f"[error] command timed out after {AGENT_TOOL_TIMEOUT}s"
+        except BaseException:
+            # CancelledError is a BaseException, so a Stop press lands here
+            # rather than in either except clause below.
+            await _stop_process(proc)
+            raise
         text = out.decode("utf-8", "replace")
         status = "" if proc.returncode == 0 else f"[exit {proc.returncode}]\n"
         return github_api.scrub(_truncate(status + (text or "(no output)")))
@@ -249,7 +276,9 @@ async def run_read_file(ctx, path: str) -> str:
     try:
         target = resolve_agent_path(ctx, path)
         with open(target, "r", encoding="utf-8", errors="replace") as f:
-            return _truncate(f.read())
+            # Scrubbed like every other tool's output: the file being read may
+            # well be this proxy's own integrations.json.
+            return github_api.scrub(_truncate(f.read()))
     except Exception as e:
         return f"[error] {e}"
 
@@ -293,40 +322,43 @@ async def run_list_dir(ctx, path: str = ".") -> str:
         for name in sorted(os.listdir(target)):
             full = os.path.join(target, name)
             entries.append(f"{name}/" if os.path.isdir(full) else name)
-        return _truncate("\n".join(entries)) if entries else "(empty)"
+        return github_api.scrub(_truncate("\n".join(entries))) if entries else "(empty)"
     except Exception as e:
         return f"[error] {e}"
 
 
 async def run_search_files(ctx, pattern: str, path: str = ".", file_glob: str = "") -> str:
+    """Runs file_search.py as a child process. See that module for why it
+    isn't just a function call: a model-supplied regex that backtracks badly
+    can't be stopped from inside this process, but a child can be killed."""
     try:
         root = resolve_agent_path(ctx, path)
-        regex = re.compile(pattern)
-        hits = []
-        scanned = 0
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS]
-            for name in sorted(filenames):
-                if file_glob and not fnmatch.fnmatch(name, file_glob):
-                    continue
-                scanned += 1
-                if scanned > SEARCH_MAX_FILES:
-                    hits.append(f"...[stopped after scanning {SEARCH_MAX_FILES} files]")
-                    return _truncate("\n".join(hits))
-                full = os.path.join(dirpath, name)
-                try:
-                    with open(full, "r", encoding="utf-8") as f:
-                        for lineno, line in enumerate(f, 1):
-                            if regex.search(line):
-                                hits.append(f"{os.path.relpath(full, root)}:{lineno}: {line.rstrip()}")
-                                if len(hits) >= SEARCH_MAX_MATCHES:
-                                    hits.append(f"...[stopped at {SEARCH_MAX_MATCHES} matches]")
-                                    return _truncate("\n".join(hits))
-                except (OSError, UnicodeDecodeError):
-                    continue  # binary or unreadable -- not what this tool is for
-        return _truncate("\n".join(hits)) if hits else "(no matches)"
+        re.compile(pattern)  # a bad pattern is a tool error, not a dead child
     except Exception as e:
         return f"[error] {e}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, SEARCH_SCRIPT, root, pattern, file_glob, str(SEARCH_TIMEOUT),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as e:
+        return f"[error] could not start the search: {e}"
+
+    try:
+        # The child stops itself at SEARCH_TIMEOUT; this is the backstop for
+        # the one case it can't -- a single re.search that never returns.
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        await _stop_process(proc)
+        return (f"[error] the search did not finish within {SEARCH_TIMEOUT}s and was stopped -- "
+                "the pattern is probably backtracking badly, try a simpler one")
+    except BaseException:
+        await _stop_process(proc)  # the run was cancelled; don't leave it scanning
+        raise
+
+    hits = out.decode("utf-8", "replace").strip()
+    return github_api.scrub(_truncate(hits)) if hits else "(no matches)"
 
 
 # ---------------------------------------------------------------------------
@@ -388,16 +420,11 @@ async def run_git_checkout(ctx, branch: str, path: str = "", create: bool = Fals
 
 
 async def run_git_push(ctx, path: str = "", remote: str = "origin", branch: str = "") -> str:
+    # Through git_tools.git_push like every other git tool, so the model can't
+    # smuggle an option (--receive-pack=...) in as a remote or branch name.
     try:
-        repo_dir = _repo_dir(ctx, path)
-        args = _git_auth_args() + ["push"]
-        if branch:
-            args += ["--set-upstream", remote, branch]
-        else:
-            args += [remote]
-        out = github_api.scrub(await git_tools.run_git(repo_dir, args))
-        # run_git returns "" for a silent success, which reads as a failure.
-        return out or f"pushed to {remote}{('/' + branch) if branch else ''}"
+        return github_api.scrub(await git_tools.git_push(
+            _repo_dir(ctx, path), remote=remote, branch=branch, config_args=_git_auth_args()))
     except Exception as e:
         return f"[error] {e}"
 
@@ -405,6 +432,16 @@ async def run_git_push(ctx, path: str = "", remote: str = "origin", branch: str 
 # ---------------------------------------------------------------------------
 # github
 # ---------------------------------------------------------------------------
+
+def _login(item: dict) -> str:
+    """GitHub sends "user": null for anything by a deleted account, so one
+    such PR or issue must not blow up the whole listing."""
+    return ((item.get("user") or {}).get("login") or "(unknown)")
+
+
+def _ref(item: dict, side: str) -> str:
+    return ((item.get(side) or {}).get("ref") or "?")
+
 
 def _short(text: str, limit: int = 400) -> str:
     text = (text or "").strip().replace("\r", "")
@@ -431,8 +468,8 @@ async def run_github_list_prs(ctx, repo: str, state: str = "open", limit: int = 
         if not pulls:
             return f"(no {state} pull requests)"
         lines = [
-            f"#{p['number']} {p['title']} [{p['state']}] by {p['user']['login']} "
-            f"({p['head']['ref']} -> {p['base']['ref']})"
+            f"#{p.get('number')} {p.get('title')} [{p.get('state')}] by {_login(p)} "
+            f"({_ref(p, 'head')} -> {_ref(p, 'base')})"
             for p in pulls
         ]
         return _truncate("\n".join(lines))
@@ -444,8 +481,8 @@ async def run_github_read_pr(ctx, repo: str, number: int, include_diff: bool = T
     try:
         pr = await github_api.get_pull(repo, number)
         parts = [
-            f"#{pr['number']} {pr['title']} [{pr['state']}{', merged' if pr.get('merged') else ''}]",
-            f"by {pr['user']['login']} · {pr['head']['ref']} -> {pr['base']['ref']} · "
+            f"#{pr.get('number')} {pr.get('title')} [{pr.get('state')}{', merged' if pr.get('merged') else ''}]",
+            f"by {_login(pr)} · {_ref(pr, 'head')} -> {_ref(pr, 'base')} · "
             f"+{pr.get('additions', 0)}/-{pr.get('deletions', 0)} across {pr.get('changed_files', 0)} file(s)",
             f"mergeable: {pr.get('mergeable_state', 'unknown')}",
             "",
@@ -454,7 +491,7 @@ async def run_github_read_pr(ctx, repo: str, number: int, include_diff: bool = T
         comments = await github_api.list_comments(repo, number)
         if comments:
             parts.append("\n--- comments ---")
-            parts += [f"{c['user']['login']}: {_short(c.get('body'), 500)}" for c in comments]
+            parts += [f"{_login(c)}: {_short(c.get('body'), 500)}" for c in comments]
         if include_diff:
             diff = await github_api.get_pull_diff(repo, number)
             parts.append("\n--- diff ---")
@@ -470,7 +507,7 @@ async def run_github_list_issues(ctx, repo: str, state: str = "open", limit: int
         if not issues:
             return f"(no {state} issues)"
         lines = [
-            f"#{i['number']} {i['title']} [{i['state']}] by {i['user']['login']} "
+            f"#{i.get('number')} {i.get('title')} [{i.get('state')}] by {_login(i)} "
             f"({i.get('comments', 0)} comment(s))"
             for i in issues
         ]
@@ -483,14 +520,14 @@ async def run_github_read_issue(ctx, repo: str, number: int) -> str:
     try:
         issue = await github_api.get_issue(repo, number)
         parts = [
-            f"#{issue['number']} {issue['title']} [{issue['state']}] by {issue['user']['login']}",
+            f"#{issue.get('number')} {issue.get('title')} [{issue.get('state')}] by {_login(issue)}",
             "",
             _short(issue.get("body") or "(no description)", 1500),
         ]
         comments = await github_api.list_comments(repo, number)
         if comments:
             parts.append("\n--- comments ---")
-            parts += [f"{c['user']['login']}: {_short(c.get('body'), 500)}" for c in comments]
+            parts += [f"{_login(c)}: {_short(c.get('body'), 500)}" for c in comments]
         return _truncate("\n".join(parts))
     except github_api.GitHubError as e:
         return f"[error] {e}"
@@ -502,8 +539,16 @@ async def run_github_clone(ctx, repo: str, branch: str = "") -> str:
     without waiting for the user to tick a box."""
     try:
         repo = github_api.check_repo(repo)
+        problem = git_tools.check_name("branch", branch) if branch else ""
+        if problem:
+            return problem
         os.makedirs(CLONE_ROOT, exist_ok=True)
         target = os.path.join(CLONE_ROOT, repo.split("/")[1])
+        # check_repo already refuses '.' and '..' as a repository name; this is
+        # the belt to that braces, since the answer decides what becomes a
+        # working directory.
+        if not path_within(norm_path(target), norm_path(CLONE_ROOT)) or norm_path(target) == norm_path(CLONE_ROOT):
+            return f"[error] '{repo}' does not name a directory inside {CLONE_ROOT}"
 
         if os.path.isdir(os.path.join(target, ".git")):
             entry = register_workdir(target, repo.split("/")[1])
@@ -771,10 +816,10 @@ def agent_system_prompt(ctx: AgentContext) -> str:
             "actions other people will see: do them only when the user has asked for "
             "that specific thing, and never as a way of 'reporting' your own progress."
         )
-    else:
+    elif ctx.allows("github"):
         lines.append(
             "You can read GitHub but not write to it -- no issues, comments, or pull "
-            "requests. Say so if the user asks for one." if ctx.allows("github") else ""
+            "requests. Say so if the user asks for one."
         )
     if ctx.allows("web"):
         lines.append("Use web_fetch/web_search for anything you'd otherwise be guessing about.")
@@ -783,4 +828,6 @@ def agent_system_prompt(ctx: AgentContext) -> str:
         "When you're done, reply with a short plain-text summary of what you did and "
         "what you found."
     )
-    return "\n".join(line for line in lines if line != "")
+    # The "" entries above are deliberate blank separators between the intro,
+    # the directory list, the scope rule and the instructions -- joined as-is.
+    return "\n".join(lines)

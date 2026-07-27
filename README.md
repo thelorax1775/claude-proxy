@@ -270,7 +270,8 @@ there's no env var to set first and no restart needed.
 Both sit above the composer and are remembered per browser:
 
 - **Agent tools** -- off means a plain chat with no tools at all. On means
-  each message can spend up to 12 tool rounds working before it answers.
+  each message can spend a budget of tool rounds working before it answers
+  (100 by default, see [Tool rounds](#tool-rounds)).
 - **Sandbox** -- on (the default) confines the file tools to the working
   directories ticked in the Agent tab: relative paths resolve against the
   primary one, absolute paths outside them are refused. Off lets the file
@@ -306,7 +307,9 @@ shell without also handing it the ability to open pull requests:
 Unticked groups aren't offered to the model at all, and are refused
 server-side if it invents a call anyway. **GitHub write is off by default** --
 those actions are publicly visible, so turning them on is a deliberate act.
-The GitHub groups only become available once a token is connected.
+The GitHub groups only become available once a token is connected. Unticking
+*every* group is allowed and means what it says: the model gets no tools, so
+the message is an ordinary chat.
 
 ### Tool rounds
 
@@ -316,10 +319,16 @@ Agent tab (up to 500).
 
 Running out **does not end the chat.** The model is asked once more with no
 tools attached, so it reports what it found and what it was mid-way through,
-and a **Continue** button appears to pick the work straight back up. Identical
-repeated tool calls don't consume the budget either -- the loop answers the
-third identical call with a nudge instead of running it again, which is what
-usually burns rounds on smaller models.
+and a **Continue** button appears to pick the work straight back up. The tool
+calls and their results stay in the conversation, so continuing resumes from
+the work itself rather than from a summary of it.
+
+Smaller models sometimes get stuck repeating one call. The third identical
+call *in a row* -- same tool, same arguments, nothing in between -- is
+answered with a nudge instead of being run again, and any different call in
+between resets that, since a write or a checkout can genuinely change what
+the repeated call would return. The round itself still counts against the
+budget; what it saves is the work.
 
 ### Using it
 
@@ -358,10 +367,17 @@ With a token connected:
   the token in the remote URL, so **the token never lands in `.git/config`**.
   Pushes authenticate the same way.
 - `GITHUB_API` defaults to `https://api.github.com`; point it at a GitHub
-  Enterprise host and the clone URL follows automatically.
+  Enterprise host and the clone URL follows automatically. (It seeds the
+  `github_api` field in `integrations.json`; a value saved through the API
+  wins over the environment.)
 
 Web search is separate: paste a Brave or Tavily key in the Agent tab to enable
 `web_search`. `web_fetch` works without any key.
+
+`web_fetch` refuses hosts that resolve to a private, loopback or link-local
+address -- including after a redirect -- so a URL the model picked can't be
+used to read this machine's own services or a cloud metadata endpoint. Set
+`AGENT_WEB_ALLOW_PRIVATE=1` if you actually want it reaching your LAN.
 
 **The real safety boundary is the machine itself, not the sandbox switch.**
 Even sandboxed, `bash` can `cd` elsewhere or use absolute paths -- the

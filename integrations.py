@@ -14,7 +14,10 @@ INTEGRATIONS_PATH = os.getenv("INTEGRATIONS_CONFIG", "integrations.json")
 # a client is rejected rather than quietly persisted.
 FIELDS = {
     "github_token": "",
-    "github_api": "https://api.github.com",
+    # Overridable for GitHub Enterprise. A value saved through the API wins;
+    # this is the default it starts from and the value clearing the field
+    # returns to.
+    "github_api": os.getenv("GITHUB_API", "https://api.github.com").rstrip("/") or "https://api.github.com",
     "search_provider": "brave",   # brave | tavily
     "search_api_key": "",
 }
@@ -40,18 +43,37 @@ INTEGRATIONS = _load()
 
 
 def save():
+    # The temp file holds the same secrets the live file does, so it has to be
+    # private from the moment it exists: created 0600, tightened again in case
+    # a stale tmp was already there with looser modes, and only then moved
+    # into place. os.replace keeps the tmp file's mode, so the live file is
+    # never briefly world-readable.
     tmp = f"{INTEGRATIONS_PATH}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(INTEGRATIONS, f, indent=2)
-    os.replace(tmp, INTEGRATIONS_PATH)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.chmod(INTEGRATIONS_PATH, 0o600)
+        os.chmod(tmp, 0o600)
     except OSError:
         pass  # best effort -- Windows and some mounts don't do POSIX modes
+    with os.fdopen(fd, "w") as f:
+        json.dump(INTEGRATIONS, f, indent=2)
+    os.replace(tmp, INTEGRATIONS_PATH)
 
 
 def get(field: str) -> str:
     return INTEGRATIONS.get(field, FIELDS.get(field, ""))
+
+
+def redact(text: str) -> str:
+    """Blank every stored secret out of a string. Anything on its way to a
+    chat bubble, a log line or a saved session goes through here -- a tool
+    that reads files can otherwise hand the model the token store itself."""
+    if not isinstance(text, str):
+        text = str(text)
+    for field in SECRET_FIELDS:
+        value = INTEGRATIONS.get(field) or ""
+        if value:
+            text = text.replace(value, "***")
+    return text
 
 
 def update(values: dict) -> list[str]:

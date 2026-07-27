@@ -8,8 +8,12 @@ dead host or a PDF is a string the model can read and react to, never an
 exception that kills the turn.
 """
 
+import asyncio
 import html
+import ipaddress
+import os
 import re
+import socket
 
 import httpx
 
@@ -28,10 +32,19 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Read a bounded prefix of the body. The response is already in memory by
-# this point, but truncating before the regex pass keeps a 50 MB page from
-# turning into 50 MB of backtracking.
+# Read a bounded prefix of the body and stop pulling once it's reached: a
+# multi-gigabyte URL must not become a multi-gigabyte string in the proxy,
+# and truncating before the regex pass keeps a 50 MB page from turning into
+# 50 MB of backtracking.
 MAX_BODY_BYTES = 2_000_000
+
+# web_fetch runs on behalf of a model, against a URL the model chose, from
+# inside whatever network the proxy sits in -- which is the shape of an SSRF.
+# Private, loopback and link-local destinations (169.254.169.254 and friends)
+# are refused unless the operator opts back in. Redirects are followed by
+# hand so a public URL can't bounce into one.
+ALLOW_PRIVATE = os.getenv("AGENT_WEB_ALLOW_PRIVATE", "").strip().lower() in ("1", "true", "yes")
+MAX_REDIRECTS = 5
 
 SEARCH_PROVIDERS = ("brave", "tavily")
 SNIPPET_LIMIT = 300
@@ -107,6 +120,52 @@ def _normalize_url(url: str) -> tuple[str, str]:
     return "", "[error] only http(s) URLs are supported"
 
 
+def _blocked_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified)
+
+
+async def _destination_error(url: httpx.URL) -> str:
+    """Empty string if this URL may be fetched, an [error] line if not. Every
+    address the host resolves to is checked, so a name that answers with both
+    a public and a private address is still refused."""
+    if ALLOW_PRIVATE:
+        return ""
+    host = url.host
+    if not host:
+        return f"[error] no host in {url}"
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, url.port or (443 if url.scheme == "https" else 80),
+                                        0, socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        return f"[error] could not resolve {host}: {e}"
+    except OSError as e:
+        return f"[error] could not resolve {host}: {e}"
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _blocked_address(ip):
+            return (f"[error] refusing to fetch {host}: it resolves to {ip}, which is on this "
+                    "machine's own network. Set AGENT_WEB_ALLOW_PRIVATE=1 on the proxy if that "
+                    "is genuinely what you want it to reach.")
+    return ""
+
+
+async def _read_capped(resp) -> bytes:
+    """Pull at most MAX_BODY_BYTES off the wire, then stop -- the point is to
+    never hold a body bigger than that, so the cap has to apply while
+    downloading rather than after."""
+    chunks, total = [], 0
+    async for chunk in resp.aiter_bytes():
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= MAX_BODY_BYTES:
+            break
+    return b"".join(chunks)[:MAX_BODY_BYTES]
+
+
 async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT) -> str:
     """Fetch a URL and return its readable text, prefixed with a source line."""
     try:
@@ -116,23 +175,53 @@ async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT) -> str:
     if max_chars <= 0:
         max_chars = OUTPUT_LIMIT
 
-    target, error = _normalize_url(url)
+    normalized, error = _normalize_url(url)
     if error:
         return error
 
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(target, headers=HEADERS)
+        target = httpx.URL(normalized)
+    except httpx.InvalidURL as e:
+        return f"[error] {normalized} is not a usable url: {e}"
+
+    resp = None
+    try:
+        # follow_redirects=False so every hop is checked before it's fetched;
+        # otherwise a public URL could 302 straight to a private address.
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
+            for _ in range(MAX_REDIRECTS + 1):
+                problem = await _destination_error(target)
+                if problem:
+                    return problem
+                request = client.build_request("GET", target, headers=HEADERS)
+                resp = await client.send(request, stream=True)
+                if resp.has_redirect_location and resp.next_request is not None:
+                    target = resp.next_request.url
+                    await resp.aclose()
+                    resp = None
+                    continue
+                break
+            else:
+                return f"[error] too many redirects (more than {MAX_REDIRECTS}) fetching {url}"
+
+            if resp is None:
+                return f"[error] could not fetch {url}"
+
+            try:
+                if resp.status_code >= 400:
+                    return f"[error] {resp.status_code} {resp.reason_phrase or ''}".rstrip() + f" fetching {resp.url}"
+                ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                source = str(resp.url)
+                raw = await _read_capped(resp)
+                encoding = resp.encoding or "utf-8"
+            finally:
+                await resp.aclose()
     except httpx.TimeoutException:
         return f"[error] timed out after 20s fetching {target}"
     except httpx.HTTPError as e:
         return f"[error] could not fetch {target}: {e}"
 
-    if resp.status_code >= 400:
-        return f"[error] {resp.status_code} {resp.reason_phrase or ''}".rstrip() + f" fetching {resp.url}"
-
-    ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-    body = resp.content[:MAX_BODY_BYTES].decode(resp.encoding or "utf-8", "replace")
+    body = raw.decode(encoding, "replace")
 
     title = ""
     if "html" in ctype:
@@ -144,7 +233,7 @@ async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT) -> str:
         # Binary bodies (images, PDFs, downloads) would just be noise.
         return f"[error] unsupported content type: {ctype}"
 
-    header = f"{resp.url}" + (f" -- {title}" if title else "")
+    header = source + (f" -- {title}" if title else "")
     return _truncate(f"{header}\n\n{text.strip()}", max_chars)
 
 

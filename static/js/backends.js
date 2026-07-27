@@ -94,7 +94,7 @@ export async function loadBackends() {
   } catch (err) {
     store.backends = [];
     $("backend-list").innerHTML =
-      `<p class="hint error">Couldn't load backends: ${escapeHtml(err.message)}. Check the proxy key up top.</p>`;
+      `<p class="hint error">Couldn't load backends: ${escapeHtml(err.message)}. Is the proxy still running?</p>`;
   }
   emit("backends");
 }

@@ -121,10 +121,17 @@ export function initGroups() {
   };
 
   on("settings", () => {
-    // A saved selection can name a group this build no longer has.
+    // A saved selection can name a group this build no longer has. Dropping
+    // those can leave the selection empty, and empty stays empty: unticking
+    // everything is a thing you're allowed to mean, and re-ticking the
+    // defaults behind your back would hand the model a shell you switched off.
+    // Defaults apply once, in initGroups, when nothing was ever saved.
     const known = new Set(store.settings.groups.map((g) => g.name));
-    store.groups = new Set([...store.groups].filter((g) => known.has(g)));
-    if (store.groups.size === 0) store.groups = new Set(store.settings.default_groups);
+    const kept = [...store.groups].filter((g) => known.has(g));
+    if (kept.length !== store.groups.size) {
+      store.groups = new Set(kept);
+      persist();
+    }
     render();
     renderSearch();
     renderRounds();

@@ -30,13 +30,16 @@ def check_repo(repo: str) -> str:
     repo = (repo or "").strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
     if not REPO_RE.match(repo):
         raise GitHubError(f"'{repo}' is not a valid owner/repo")
+    # REPO_RE allows dots, so 'owner/..' gets this far; callers join the name
+    # onto a clone root, where '..' would escape it.
+    if any(part in (".", "..") for part in repo.split("/")):
+        raise GitHubError(f"'{repo}' is not a valid owner/repo")
     return repo
 
 
 def scrub(text: str) -> str:
-    """Never let a token reach a chat bubble or a log line."""
-    token = integrations.get("github_token")
-    return text.replace(token, "***") if token else text
+    """Never let a stored secret reach a chat bubble or a log line."""
+    return integrations.redact(text)
 
 
 async def request(method: str, path: str, *, params=None, json_body=None, accept: str | None = None):

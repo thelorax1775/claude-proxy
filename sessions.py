@@ -2,9 +2,11 @@
 
 One JSON file per conversation under SESSIONS_DIR, holding both the messages
 the model sees and the transcript the UI replays (tool calls and their output
-included, which the model-facing history doesn't carry). Small enough that
-reading and rewriting a whole file per turn is fine, and it means a session
-survives a browser reload or a proxy restart.
+included, which the model-facing history doesn't carry). One file is read and
+rewritten per turn, which is fine at this size, and it means a session
+survives a browser reload or a proxy restart. The sidebar listing is the one
+place that touches every file, so it caches per file rather than re-parsing
+transcripts that haven't changed.
 """
 
 import json
@@ -55,16 +57,47 @@ def summary(session: dict) -> dict:
     }
 
 
+# Building the sidebar means a summary per session, but a session file holds
+# every message and every tool result -- a chat that read a few large files is
+# megabytes, and the listing is refreshed after each turn. Cache the summary
+# against the file's (mtime, size) so only files that actually changed are
+# parsed again.
+_SUMMARY_CACHE: dict[str, tuple[int, int, dict]] = {}
+
+
+def _cached_summary(session_id: str, path: str) -> dict | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    cached = _SUMMARY_CACHE.get(session_id)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    session = _read(session_id)
+    if not session or not session.get("id"):
+        return None
+    value = summary(session)
+    _SUMMARY_CACHE[session_id] = (stat.st_mtime_ns, stat.st_size, value)
+    return value
+
+
 def list_sessions() -> list[dict]:
     if not os.path.isdir(SESSIONS_DIR):
         return []
     out = []
+    live = set()
     for name in os.listdir(SESSIONS_DIR):
         if not name.endswith(".json"):
             continue
-        session = _read(name[:-5])
-        if session and session.get("id"):
-            out.append(summary(session))
+        session_id = name[:-5]
+        if not ID_RE.match(session_id):
+            continue
+        live.add(session_id)
+        entry = _cached_summary(session_id, os.path.join(SESSIONS_DIR, name))
+        if entry:
+            out.append(entry)
+    for stale in _SUMMARY_CACHE.keys() - live:
+        _SUMMARY_CACHE.pop(stale, None)
     return sorted(out, key=lambda s: s["updated"], reverse=True)
 
 
@@ -113,17 +146,10 @@ def update(session_id: str, changes: dict) -> dict | None:
 def delete(session_id: str) -> bool:
     try:
         os.remove(_path(session_id))
+        _SUMMARY_CACHE.pop(session_id, None)
         return True
     except (OSError, ValueError):
         return False
-
-
-def title_from(text: str) -> str:
-    """First line of the opening message, trimmed -- good enough as a name
-    until someone renames it."""
-    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
-    line = re.sub(r"\s+", " ", line)
-    return (line[:60] + "…") if len(line) > 60 else (line or "New chat")
 
 
 def _prune():

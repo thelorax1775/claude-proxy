@@ -27,7 +27,9 @@ CREDENTIAL_URL_RE = re.compile(r"(https?://)[^\s/@]+@")
 
 # Anything starting with "-" would be read as an option, not a branch/remote.
 # git's own "--" separator doesn't help for these positions, so refuse instead.
-def _check_name(kind: str, value: str) -> str:
+# Public because callers outside this module (github_clone's --branch) need
+# the same guard on the same kind of model-supplied value.
+def check_name(kind: str, value: str) -> str:
     if not value:
         return f"[error] {kind} is required"
     if value.startswith("-"):
@@ -181,7 +183,7 @@ async def git_commit(cwd: str, message: str, add_all: bool = True) -> str:
 
 
 async def git_checkout(cwd: str, branch: str, create: bool = False) -> str:
-    problem = _check_name("branch", branch)
+    problem = check_name("branch", branch)
     if problem:
         return problem
     args = ["checkout", "-b", branch] if create else ["checkout", branch]
@@ -192,13 +194,17 @@ async def git_checkout(cwd: str, branch: str, create: bool = False) -> str:
     return f"{verb} branch '{branch}'" + (f"\n{out}" if out else "")
 
 
-async def git_push(cwd: str, remote: str = "origin", branch: str = "") -> str:
+async def git_push(cwd: str, remote: str = "origin", branch: str = "", config_args: list | None = None) -> str:
+    """config_args is prepended to the git command line -- it's how the caller
+    passes `-c http.extraHeader=...` so a push can authenticate without the
+    credential ever touching .git/config. It comes from the proxy, never from
+    the model; remote and branch do, which is what check_name is for."""
     remote = remote or "origin"
-    problem = _check_name("remote", remote)
+    problem = check_name("remote", remote)
     if problem:
         return problem
     if branch:
-        problem = _check_name("branch", branch)
+        problem = check_name("branch", branch)
         if problem:
             return problem
         # An explicit branch is usually a first push of a new branch, so track it.
@@ -207,7 +213,7 @@ async def git_push(cwd: str, remote: str = "origin", branch: str = "") -> str:
     else:
         args = ["push", remote]
         target = f"{remote} (current branch)"
-    out = await run_git(cwd, args)
+    out = await run_git(cwd, list(config_args or []) + args)
     if _failed(out):
         return out
     return f"pushed to {target}" + (f"\n{out}" if out else "")
