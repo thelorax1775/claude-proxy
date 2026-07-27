@@ -11,6 +11,7 @@ import { initGithub, loadRepos } from "./github.js";
 import { initSessions, loadSessions } from "./sessions.js";
 import { initActivity, loadActivity } from "./activity.js";
 import { initChat, agentOn, sandboxOn } from "./chat.js";
+import { initCli } from "./cli.js";
 
 function renderPills() {
   const count = store.backends.length;
@@ -85,6 +86,7 @@ initWorkdirs();
 initActivity();
 initSessions();
 initChat();
+initCli();
 
 on("backends", renderPills);
 on("mode", renderPills);

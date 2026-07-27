@@ -152,6 +152,12 @@ body {
   margin-bottom: -1px;
   cursor: pointer;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  /* The panel is a fixed 310px, so tabs get ~56px each. Keep every label on
+     one line: a wrapped label makes the whole row two rows tall. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .tab:hover { color: var(--text); background: var(--surface-2); }
 .tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -388,6 +394,23 @@ button { font: inherit; cursor: pointer; }
 .disclosure[open] > summary { margin-bottom: 0.6rem; color: var(--text); }
 .disclosure[open] > summary::before { content: "\2212 "; }
 .disclosure > summary::-webkit-details-marker { display: none; }
+
+/* Copyable snippets in the side panel. The panel is narrow and these hold
+   URLs and JSON, so they wrap rather than scroll sideways -- a horizontal
+   scrollbar in a 310px drawer hides exactly the part you came to read. */
+.code-block {
+  margin: 0;
+  padding: 0.55rem 0.65rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
 
 .hint { font-size: 0.72rem; color: var(--muted); margin: 0; }
 .hint.error { color: var(--danger); }
