@@ -1,0 +1,6 @@
+# Test-only dependencies. The proxy itself still needs nothing but the four
+# packages in requirements.txt -- httpx is already one of them, and it brings
+# the MockTransport and ASGITransport the tests run everything through, so
+# nothing here ever touches the network.
+pytest==8.3.4
+pytest-asyncio==0.25.0
