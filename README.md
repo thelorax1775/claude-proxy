@@ -55,6 +55,11 @@ which backend served each request.
   (Groq, Google AI Studio, Cerebras, OpenRouter, NVIDIA NIM), and/or your
   own Ollama instance
 
+Two optional command-line tools, only for agent mode: `git` for the git and
+GitHub tool groups, and an OpenSSH client (`ssh`/`scp`) for the SSH group.
+Each group reports itself unavailable rather than failing if its tool is
+missing.
+
 ---
 
 ## Point Claude Code at it
@@ -125,7 +130,9 @@ the proxy buckets on the string:
 - contains `haiku` → that backend's `small_model`
 - everything else (sonnet, opus, default) → that backend's `big_model`
 
-Change the mapping in `backends.json`, not in code.
+Change the mapping in `backends.json`, or from the pencil button on the
+backend's card in the **Backends** tab. A backend missing one of the two
+fields falls back to the other rather than failing.
 
 **Every model you list must support function/tool calling.** Claude Code's
 file editing and bash execution run through Anthropic tool-use blocks,
@@ -144,16 +151,36 @@ adding a model.
 local Ollama instance last, which has no quota to exhaust. First backend that
 answers wins.
 
+A backend that fails then **sits out for a while** rather than going straight
+back to the front of the queue: 60 seconds after a rate limit or a connection
+error, 300 after a 401/403, since a rejected key doesn't recover the way a
+quota does. Without that, every request re-pays the same 429 before falling
+through to an account that can actually answer. `Retry-After` is honoured when
+the provider sends one, a success clears it early, and so does pasting a new
+key. A benched backend shows a **cooling** tag on its card, so it never
+silently vanishes from the chain. The two durations are `BACKEND_COOLDOWN` and
+`BACKEND_AUTH_COOLDOWN` in `.env`.
+
+Cooling can never empty the chain: if every backend is benched they're all
+tried anyway. An answer from an over-quota account beats no answer.
+
 Watch it happen live in the **Backends** tab, or:
 
 ```bash
 curl http://127.0.0.1:8082/status
 ```
 
-The **Backends** tab is the easiest way to edit this: provider presets, a
+The **Backends** tab is the easiest way to manage this: provider presets, a
 **Detect models** button that pulls the real model list from the provider
 instead of you typing model IDs by hand, and drag-free reordering. It writes
 `backends.json` for you, so keys never go through a chat transcript.
+
+**To change an existing backend**, press the pencil on its card: name, base
+URL, both models and the key. **Leave the key field blank to keep the saved
+one** -- the API never hands a key back to the browser, so a blank field means
+"unchanged", not "erase". Detect models works here too; the server uses the
+stored key, which the browser doesn't have. Renaming keeps the key, so there's
+no reason to delete and re-add.
 
 ### Where to get free keys
 
@@ -236,10 +263,10 @@ only you can reach. Never expose this port to the internet.
 ## Agent tools
 
 Lets the model in the web UI's chat actually work on the machine hosting the
-proxy: run commands, read and edit files, drive git, use GitHub, and fetch
-from the web. This is **separate from Claude Code**, which has its own tools
-and is unaffected by any of it. Everything is controlled from the UI -- no
-env var to set first, no restart.
+proxy: run commands, read and edit files, drive git, use GitHub, fetch from
+the web, and reach other machines over SSH. This is **separate from Claude
+Code**, which has its own tools and is unaffected by any of it. Everything is
+controlled from the UI -- no env var to set first, no restart.
 
 ### The three switches
 
@@ -338,13 +365,16 @@ shell without also handing it the ability to open pull requests:
 | GitHub | 11 | `github_list_repos`, `github_clone`, `github_list_prs`, `github_read_pr`, `github_list_issues`, `github_read_issue`, `github_ci`, `github_read_file`, `github_list_branches`, `github_search_code`, `github_read_commit` |
 | GitHub write | 7 | `github_create_issue`, `github_comment`, `github_create_pr`, `github_merge_pr`, `github_review_pr`, `github_close_issue`, `github_write_file` |
 | Web | 3 | `web_fetch`, `web_search`, `http_request` |
+| SSH | 4 | `ssh_list_hosts`, `ssh_run`, `ssh_upload`, `ssh_download` |
 
 Unticked groups aren't offered to the model at all, and are refused
 server-side if it invents a call anyway. The GitHub groups only become
-available once a token is connected. Unticking *every* group is allowed and
-means what it says: no tools, so the message is an ordinary chat.
+available once a token is connected, and SSH once a host is registered.
+Unticking *every* group is allowed and means what it says: no tools, so the
+message is an ordinary chat.
 
-**Two groups are off by default**, because they do things you can't take back:
+**Three groups are off by default**, because they do things you can't take
+back:
 
 - **Files: move & delete** -- `delete_file` removes one file at a time and
   refuses directories outright, so there's no recursive tree delete to get
@@ -353,6 +383,8 @@ means what it says: no tools, so the message is an ordinary chat.
 - **GitHub write** -- publicly visible actions. `github_merge_pr` and
   `github_review_pr` are the two worth thinking about before ticking: an
   approval can be what allows a merge.
+- **SSH** -- `ssh_run` is a shell on a *different* machine, one this proxy's
+  sandbox has no authority over at all. See [SSH hosts](#ssh-hosts).
 
 Things worth knowing about individual tools:
 
@@ -373,6 +405,60 @@ Things worth knowing about individual tools:
   returned raw. `web_fetch` is for reading pages and strips markup. Both run
   through the same redirect-checked destination guard, so both respect the
   LAN switch.
+- `bash` takes an optional `timeout` (default 30s, up to 300). Raise it for a
+  build or a test suite rather than watching the default cut one short.
+
+### SSH hosts
+
+Lets agent mode reach machines *other* than the one running the proxy: run
+commands on them, and copy files each way.
+
+**The registry is the allowlist.** You add hosts in the Agent tab; the tools
+take a registered **name** and there is no way to hand them a connection
+string. So the set of machines the model can reach is exactly the set you
+typed in, and it cannot add to it. Hosts live in `ssh_hosts.json`
+(gitignored, written `chmod 600`).
+
+**Auth is key-based only.** No password is stored, and none can be typed:
+connections run with `BatchMode=yes`, `PasswordAuthentication=no` and
+`NumberOfPasswordPrompts=0`, so ssh can never sit at a prompt. Without that,
+a first-contact host key or a password request becomes a tool call that hangs
+until the timeout with nothing to explain why -- there's nobody at a terminal
+to answer it. Leave **Key file** blank to use the proxy user's default keys or
+agent, or give an absolute path to a specific one.
+
+**Host keys use `StrictHostKeyChecking=accept-new`**: the first connection
+records the host's key, and a key that *changes* afterwards is refused
+loudly. `no` would silently accept a substituted key -- which is to say,
+accept a machine-in-the-middle -- and `yes` makes first contact fail until
+someone hand-edits `known_hosts`. Set `AGENT_SSH_STRICT_HOST_KEY=yes` if you
+pre-populate `known_hosts` and want the stricter one.
+
+Each host card has a **Test** button that connects and runs `true`. Use it
+before involving a model: it turns "the tool timed out" into
+`Permission denied (publickey)` or `Connection timed out`, which is the
+difference between a five-minute fix and an afternoon.
+
+Worth knowing:
+
+- **The sandbox does not extend to the far side.** Working directories bound
+  the *local* half of `ssh_upload`/`ssh_download`, and nothing else. On the
+  remote machine the model has whatever that account has, with no undo.
+- Sessions are non-interactive, so anything that waits for input times out
+  instead of prompting -- prefer `-y` and friends.
+- `ssh_run` takes an optional `timeout` (default 120s, up to 600) because a
+  remote build or package update routinely needs more than a local command.
+  A command that times out is disconnected, but **may keep running on the
+  remote host**: ssh has no way to kill it from this end.
+- `ssh_download` refuses to overwrite an existing local file.
+- The group stays unavailable, and says why, until there is both a registered
+  host and an `ssh` binary on the proxy's machine.
+
+> Under the systemd unit, `ProtectHome=true` hides the service user's home,
+> so `~/.ssh` is unreachable and every connection fails on the key *and* on
+> writing `known_hosts`. Keep both inside `/opt/claude-proxy/.ssh` and set
+> `AGENT_SSH_KNOWN_HOSTS` -- `deploy/claude-proxy.service` spells out the
+> exact commands.
 
 ### Tool rounds
 
@@ -391,6 +477,11 @@ call *in a row* -- same tool, same arguments, nothing in between -- is
 answered with a nudge instead of being run again. Any different call in
 between resets that, since a write or a checkout can genuinely change what
 the repeated call would return.
+
+The budget counts *rounds*, and one round can ask for several tools at once,
+so there's a second cap of 25 calls per round. Anything past it is answered
+with an error rather than run, which keeps one confused answer from spending
+the whole budget before the loop gets to look at anything.
 
 ### Using it
 
@@ -539,9 +630,10 @@ saved work.
 
 Everything the project needs is in this one repo: the proxy (`main.py`), the
 agent layer (`agent_tools.py`, `git_tools.py`, `github_api.py`,
-`web_tools.py`, `file_search.py`), saved chats (`sessions.py`), credentials
-(`integrations.py`), and a static web UI. All state specific to your setup is
-created locally and gitignored, so cloning this repo is safe to do publicly:
+`ssh_tools.py`, `web_tools.py`, `file_search.py`), saved chats
+(`sessions.py`), credentials (`integrations.py`), tests (`tests/`), and a
+static web UI. All state specific to your setup is created locally and
+gitignored, so cloning this repo is safe to do publicly:
 
 | file | holds |
 | --- | --- |
@@ -549,10 +641,33 @@ created locally and gitignored, so cloning this repo is safe to do publicly:
 | `backends.json` | provider URLs, models, API keys |
 | `workdirs.json` | directories agent mode may work in |
 | `integrations.json` | GitHub token, web-search key (written `chmod 600`) |
+| `ssh_hosts.json` | SSH hosts agent mode may connect to (written `chmod 600`) |
 | `sessions/` | saved chats |
 | `workspace/` | the default agent working directory |
 
+Every stored secret -- the GitHub token, the search key, and each provider key
+in `backends.json` -- is blanked out of tool output before it reaches a chat
+bubble, a log line or a saved session. So asking the agent to read
+`backends.json`, or to run `env`, returns `***` rather than your keys.
+
 See `.env.example` for every environment variable and its default.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+They cover the Anthropic↔OpenAI translation, the streaming SSE conversion,
+failover and cooldown, the backend API, the agent loop's conversation
+bookkeeping, and the SSH registry's validation. Everything runs against
+in-process stubs, so the suite needs no network, no API key and no `ssh`
+binary, and it redirects every state path to a temp directory -- running it
+can't touch your real `backends.json` or `sessions/`.
+
+`requirements.txt` is unchanged: the proxy itself still needs only four
+packages. The test-only dependencies live in `requirements-dev.txt`.
 
 ### Verify the translation layer directly
 
@@ -581,18 +696,31 @@ You should see Anthropic-style SSE events (`message_start`,
 | `POST /v1/messages` | What Claude Code talks to (Anthropic → OpenAI translation) |
 | `POST /v1/messages/count_tokens` | Rough `len/4` estimate for context bookkeeping |
 | `GET /health` | Liveness plus the configured backend names |
-| `GET /status` | Last 50 backend attempts, newest last |
+| `GET /status` | Last 50 backend attempts, newest last, plus what's cooling |
 | `POST /api/approvals/{id}` | Answer a tool call a manual-mode run is parked on |
 | `POST /api/upload?name=&path=` | Raw-body file upload into a registered working directory |
+| `GET/POST /api/ssh-hosts` | List and register SSH hosts |
+| `DELETE /api/ssh-hosts?name=` | Unregister one |
+| `POST /api/ssh-hosts/{name}/test` | Connect and run `true`; reports latency or the ssh error |
 | `GET /` | The web UI |
+
+`PATCH /api/backends/{name}` takes `name`, `base_url`, `big_model`,
+`small_model` and `api_key`. A blank `api_key` leaves the stored key alone;
+send `null` to clear it. `POST /api/probe-models` accepts either a
+`base_url` + `api_key` pair (the add form) or the `name` of a saved backend,
+in which case it uses that backend's stored key.
 
 ### Known limitations
 
 - Images in messages are dropped with a placeholder, not forwarded.
 - Extended thinking and prompt caching are Anthropic-specific and not
   emulated.
-- Token counts from `/v1/messages/count_tokens` are a rough `len/4` estimate,
-  fine for context-window bookkeeping but not exact.
+- Token counts from `/v1/messages/count_tokens` are a rough `len/4` estimate
+  over the *text* of a request only: tool schemas and tool results aren't
+  counted, so an agentic turn reads as much smaller than it is.
+- `output_tokens` on a streamed response is the provider's own count when it
+  volunteers one, and the same `len/4` estimate otherwise. `input_tokens` on
+  `message_start` is still reported as 0.
 - Failover only happens *before* a streaming response starts sending to
   Claude Code. If a backend dies mid-stream after already answering, that turn
   errors out rather than silently jumping to the next backend -- Claude Code
