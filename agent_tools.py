@@ -54,6 +54,10 @@ AGENT_OUTPUT_LIMIT = int(os.getenv("AGENT_OUTPUT_LIMIT", "8000"))
 # The UI can raise or lower it per message, up to ROUND_CEILING.
 MAX_AGENT_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "100"))
 ROUND_CEILING = int(os.getenv("AGENT_ROUND_CEILING", "500"))
+# The round budget bounds rounds, not calls, and a model is free to ask for any
+# number of tools in one answer. Without a cap, one confused round can spend an
+# unbounded amount of time before the loop gets to check anything.
+MAX_CALLS_PER_ROUND = int(os.getenv("AGENT_MAX_CALLS_PER_ROUND", "25"))
 
 
 def clamp_rounds(requested) -> int:
@@ -258,22 +262,10 @@ def resolve_agent_path(ctx: AgentContext, path: str) -> str:
 # shell + files
 # ---------------------------------------------------------------------------
 
-async def _stop_process(proc):
-    """Kill a child that is still running and reap it. Used on both exits that
-    aren't a clean finish -- the timeout, and the run being cancelled because
-    the user pressed Stop -- so neither leaves the command executing behind a
-    UI that says it stopped, nor a zombie behind the loop."""
-    if proc.returncode is None:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass  # it exited between the check and the signal
-    try:
-        # Shielded: on the cancellation path the await would otherwise be
-        # cancelled again immediately, before the child is collected.
-        await asyncio.shield(proc.wait())
-    except BaseException:
-        pass
+# One implementation for every subprocess tool in the project; it lives in
+# git_tools (which this module already imports) so the git wrappers get the
+# same cancellation safety.
+_stop_process = git_tools.stop_process
 
 
 async def run_bash(ctx, command: str, cwd: str = "") -> str:

@@ -63,15 +63,46 @@ def get(field: str) -> str:
     return INTEGRATIONS.get(field, FIELDS.get(field, ""))
 
 
+# Secrets this module doesn't own but that must still never reach a chat
+# bubble -- the provider keys in backends.json, above all. Registered as
+# callables rather than copied in, so rotating a key through the UI takes
+# effect immediately and nothing here has to import main.
+_SECRET_SOURCES = []
+
+# Below this length a "secret" is more likely to appear by coincidence in
+# ordinary output than to be the key itself, and blanking it would corrupt
+# what the model reads.
+MIN_REDACTABLE = 8
+
+
+def register_secret_source(fn) -> None:
+    """Register a callable returning an iterable of secret strings to blank
+    out alongside the ones stored here."""
+    _SECRET_SOURCES.append(fn)
+
+
+def _all_secrets():
+    for field in SECRET_FIELDS:
+        yield INTEGRATIONS.get(field) or ""
+    for source in _SECRET_SOURCES:
+        try:
+            for value in source() or ():
+                yield value if isinstance(value, str) else ""
+        except Exception:
+            # A broken source must not be able to stop redaction happening at
+            # all -- that would fail open, which is the one outcome to avoid.
+            continue
+
+
 def redact(text: str) -> str:
-    """Blank every stored secret out of a string. Anything on its way to a
+    """Blank every known secret out of a string. Anything on its way to a
     chat bubble, a log line or a saved session goes through here -- a tool
-    that reads files can otherwise hand the model the token store itself."""
+    that reads files can otherwise hand the model the token store itself,
+    and `bash: env` can hand it every provider key at once."""
     if not isinstance(text, str):
         text = str(text)
-    for field in SECRET_FIELDS:
-        value = INTEGRATIONS.get(field) or ""
-        if value:
+    for value in _all_secrets():
+        if value and len(value) >= MIN_REDACTABLE:
             text = text.replace(value, "***")
     return text
 

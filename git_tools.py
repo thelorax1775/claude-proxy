@@ -52,6 +52,28 @@ def _clean(text: str) -> str:
     return _truncate(_redact(text))
 
 
+async def stop_process(proc):
+    """Kill a child that is still running and reap it. Used on both exits that
+    aren't a clean finish -- the timeout, and the run being cancelled because
+    the user pressed Stop -- so neither leaves the command executing behind a
+    UI that says it stopped, nor a zombie behind the loop.
+
+    Lives here rather than in agent_tools because agent_tools imports this
+    module, not the other way round, and every subprocess tool in the project
+    needs it."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # it exited between the check and the signal
+    try:
+        # Shielded: on the cancellation path the await would otherwise be
+        # cancelled again immediately, before the child is collected.
+        await asyncio.shield(proc.wait())
+    except BaseException:
+        pass
+
+
 async def _exec(cwd: str, args: list, timeout: int):
     """One `git ...` run. Returns (returncode, combined stdout+stderr), or
     (None, "") if it had to be killed for running past the timeout."""
@@ -62,9 +84,15 @@ async def _exec(cwd: str, args: list, timeout: int):
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()  # reap it rather than leaving a zombie behind
+        await stop_process(proc)
         return None, ""
+    except BaseException:
+        # CancelledError is a BaseException, so pressing Stop lands here. Left
+        # unhandled it walked out of this function with the child still
+        # running -- a `git clone` that keeps writing after the UI says the run
+        # stopped.
+        await stop_process(proc)
+        raise
     return proc.returncode, out.decode("utf-8", "replace")
 
 

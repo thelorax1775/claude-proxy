@@ -59,6 +59,12 @@ def load_backends() -> list[dict]:
 BACKENDS = load_backends()
 BACKENDS_PATH = os.getenv("BACKENDS_CONFIG", "backends.json")
 
+# Provider keys are secrets too. Without this, agent mode reading backends.json
+# -- or just running `env` -- puts every key straight into a chat bubble and
+# into the saved session on disk. Registered as a callable so a key changed
+# through the UI is covered immediately.
+integrations.register_secret_source(lambda: [b.get("api_key", "") for b in BACKENDS])
+
 
 def save_backends():
     tmp = f"{BACKENDS_PATH}.tmp"
@@ -67,6 +73,17 @@ def save_backends():
     os.replace(tmp, BACKENDS_PATH)
 
 HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+# Set by the test suite to an httpx.MockTransport so the whole failover and
+# translation stack can be exercised without a network. None in normal use,
+# which is httpx's own default.
+UPSTREAM_TRANSPORT = None
+
+
+def upstream_client(timeout=HTTP_TIMEOUT) -> httpx.AsyncClient:
+    """Every call out to a backend goes through here, so there is one place to
+    intercept them."""
+    return httpx.AsyncClient(timeout=timeout, transport=UPSTREAM_TRANSPORT)
 
 # Status codes worth failing over on. 401/403 included because a dead/expired
 # free-tier key should not take the whole proxy down -- skip to the next one.
@@ -90,10 +107,57 @@ MAX_AGENT_ITERATIONS = agent_tools.MAX_AGENT_ITERATIONS
 
 
 def pick_model(claude_model: str, backend: dict) -> str:
+    """Which of a backend's models answers this request. Read with .get rather
+    than [] because backends.json is hand-editable: a missing small_model
+    should fall back to the big one, not 500 every request that mentions
+    haiku."""
+    big = backend.get("big_model") or ""
+    small = backend.get("small_model") or ""
     m = (claude_model or "").lower()
     if "haiku" in m:
-        return backend["small_model"]
-    return backend["big_model"]
+        return small or big
+    return big or small
+
+
+def tool_args_dict(raw) -> dict:
+    """A tool call's arguments as a dict. OpenAI specifies a JSON *string*,
+    but llama.cpp's server, some vLLM builds and a few gateways send the
+    object itself -- json.loads on a dict raises TypeError, which used to be
+    an unhandled 500. Never raises; unparseable arguments become {}."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def tool_args_str(raw) -> str:
+    """The same arguments as the JSON string every downstream consumer wants.
+    A provider that sent an object gets it serialised here, once, rather than
+    embedded raw into an input_json_delta the client can't parse."""
+    if isinstance(raw, str):
+        return raw
+    if raw is None:
+        return ""
+    try:
+        return json.dumps(raw)
+    except (TypeError, ValueError):
+        return ""
+
+
+def first_choice(data: dict) -> dict:
+    """The first choice of a completion, or {} if there isn't one. Providers do
+    return an empty choices list -- content filters and some error shapes both
+    do it -- and indexing [0] there is a 500 on /v1/messages or a stream that
+    dies mid-agent-run with the work already done thrown away."""
+    choices = (data or {}).get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return choices[0]
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +307,8 @@ FINISH_REASON_MAP = {
 
 
 def openai_response_to_anthropic(nim_data: dict, claude_model: str) -> dict:
-    choice = nim_data["choices"][0]
-    message = choice.get("message", {})
+    choice = first_choice(nim_data)
+    message = choice.get("message") or {}
     content_blocks = []
 
     text = message.get("content")
@@ -252,15 +316,18 @@ def openai_response_to_anthropic(nim_data: dict, claude_model: str) -> dict:
         content_blocks.append({"type": "text", "text": text})
 
     for tc in message.get("tool_calls") or []:
-        try:
-            args = json.loads(tc["function"]["arguments"] or "{}")
-        except json.JSONDecodeError:
-            args = {}
+        fn = (tc or {}).get("function") or {}
+        name = fn.get("name")
+        if not name:
+            # A tool_use block with no name is unusable to Claude Code and
+            # would be rejected; drop it rather than pass it through.
+            log.warning("dropping a tool_call with no function name: %r", tc)
+            continue
         content_blocks.append({
             "type": "tool_use",
-            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-            "name": tc["function"]["name"],
-            "input": args,
+            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": name,
+            "input": tool_args_dict(fn.get("arguments")),
         })
 
     if not content_blocks:
@@ -291,6 +358,19 @@ def sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _output_tokens(upstream_usage, generated_chars: int) -> int:
+    """What to report as output_tokens for a streamed response. Prefer the
+    provider's own count when it sent one; otherwise the same rough chars/4
+    estimate count_tokens uses. Claude Code spends this on context and cost
+    accounting, so a number in the wrong unit is worse than an approximate
+    one in the right unit."""
+    if isinstance(upstream_usage, dict):
+        reported = upstream_usage.get("completion_tokens")
+        if isinstance(reported, int) and reported >= 0:
+            return reported
+    return max(0, generated_chars // 4)
+
+
 def backend_headers(backend: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     if backend.get("api_key"):
@@ -303,7 +383,9 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
     (response, backend) for the first one that isn't rate-limited/erroring,
     or (None, None) if all backends were exhausted."""
     last_error = None
-    for backend in BACKENDS:
+    # Snapshot: this loop spans awaits, and deleting or reordering a backend
+    # from the UI mid-request would otherwise silently skip the next entry.
+    for backend in list(BACKENDS):
         payload = build_openai_payload(body, backend)
         payload["stream"] = True
         url = f"{backend['base_url']}/chat/completions"
@@ -355,9 +437,17 @@ async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, clau
     next_index = 0
     text_index = None
     text_open = False
-    tool_state = {}  # openai tc index -> {"index": anthropic_index, "opened": bool}
+    # openai tool-call index -> {"index": anthropic index or None until opened,
+    # "id", "name", "pending": [argument fragments seen before the name was]}.
+    # A block can't be opened until its name is known, because content_block_start
+    # carries the name and there is no event to correct it afterwards.
+    tool_state = {}
+    last_tc_key = None
+    synthetic_keys = 0
     finish_reason = "stop"
-    completion_tokens_estimate = 0
+    # Fallback only. A provider that reports real usage wins over this.
+    text_chars = 0
+    upstream_usage = None
 
     try:
         async for line in resp.aiter_lines():
@@ -371,12 +461,18 @@ async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, clau
             except json.JSONDecodeError:
                 continue
 
-            choices = chunk.get("choices") or []
-            if not choices:
+            # Providers that volunteer usage put it on a chunk near the end,
+            # often one with an empty choices list -- so read it before the
+            # no-choices check below drops the chunk.
+            if isinstance(chunk.get("usage"), dict):
+                upstream_usage = chunk["usage"]
+
+            choice = first_choice(chunk)
+            if not choice:
                 continue
-            delta = choices[0].get("delta", {})
-            if choices[0].get("finish_reason"):
-                finish_reason = choices[0]["finish_reason"]
+            delta = choice.get("delta") or {}
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
 
             if delta.get("content"):
                 if not text_open:
@@ -387,43 +483,87 @@ async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, clau
                         "type": "content_block_start", "index": text_index,
                         "content_block": {"type": "text", "text": ""},
                     })
-                completion_tokens_estimate += 1
+                text_chars += len(delta["content"])
                 yield sse_event("content_block_delta", {
                     "type": "content_block_delta", "index": text_index,
                     "delta": {"type": "text_delta", "text": delta["content"]},
                 })
 
             for tc in delta.get("tool_calls") or []:
-                idx = tc["index"]
-                if idx not in tool_state:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+
+                # 'index' is how OpenAI ties fragments to a call, but several
+                # OpenAI-compatible providers leave it out when streaming one
+                # call at a time. Reading it with [] was a KeyError, i.e. a 500
+                # in the middle of a stream Claude Code is already consuming.
+                key = tc.get("index")
+                if not isinstance(key, int):
+                    current = tool_state.get(last_tc_key)
+                    new_id = tc.get("id")
+                    if current is not None and (not new_id or new_id == current["id"]):
+                        key = last_tc_key          # more of the call in progress
+                    else:
+                        synthetic_keys += 1        # a different id means a new call
+                        key = f"auto-{synthetic_keys}"
+                last_tc_key = key
+
+                state = tool_state.get(key)
+                if state is None:
+                    state = tool_state[key] = {"index": None, "id": "", "name": "", "pending": []}
+                if tc.get("id"):
+                    state["id"] = tc["id"]
+                # First non-empty name wins. Providers send the name once, but
+                # not always in the first fragment -- taking only the first
+                # fragment's name is what produced tool_use blocks named "".
+                if fn.get("name") and not state["name"]:
+                    state["name"] = fn["name"]
+
+                # A provider that sends the whole object instead of a JSON
+                # string gets it serialised here; embedding it raw produced an
+                # input_json_delta Claude Code silently failed to parse, which
+                # reads as "the model forgot how to use tools".
+                args_fragment = tool_args_str(fn.get("arguments"))
+                if args_fragment:
+                    text_chars += len(args_fragment)
+                    state["pending"].append(args_fragment)
+
+                if state["index"] is None and state["name"]:
                     if text_open:
-                        yield sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                        yield sse_event("content_block_stop",
+                                        {"type": "content_block_stop", "index": text_index})
                         text_open = False
-                    a_index = next_index
+                    state["index"] = next_index
                     next_index += 1
-                    tool_state[idx] = {"index": a_index}
                     yield sse_event("content_block_start", {
-                        "type": "content_block_start", "index": a_index,
+                        "type": "content_block_start", "index": state["index"],
                         "content_block": {
                             "type": "tool_use",
-                            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                            "name": tc.get("function", {}).get("name", ""),
+                            "id": state["id"] or f"toolu_{uuid.uuid4().hex[:24]}",
+                            "name": state["name"],
                             "input": {},
                         },
                     })
-                args_fragment = tc.get("function", {}).get("arguments")
-                if args_fragment:
-                    completion_tokens_estimate += 1
-                    yield sse_event("content_block_delta", {
-                        "type": "content_block_delta", "index": tool_state[idx]["index"],
-                        "delta": {"type": "input_json_delta", "partial_json": args_fragment},
-                    })
+                if state["index"] is not None and state["pending"]:
+                    for fragment in state["pending"]:
+                        yield sse_event("content_block_delta", {
+                            "type": "content_block_delta", "index": state["index"],
+                            "delta": {"type": "input_json_delta", "partial_json": fragment},
+                        })
+                    state["pending"].clear()
     finally:
         await resp.aclose()
 
     if text_open:
         yield sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index})
     for state in tool_state.values():
+        if state["index"] is None:
+            # Arguments streamed but a name never arrived. There is nothing
+            # callable to hand Claude Code, so say so rather than emit a
+            # nameless tool_use it will reject.
+            log.warning("dropping a streamed tool call that never sent a function name")
+            continue
         yield sse_event("content_block_stop", {"type": "content_block_stop", "index": state["index"]})
 
     yield sse_event("message_delta", {
@@ -432,7 +572,10 @@ async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, clau
             "stop_reason": FINISH_REASON_MAP.get(finish_reason, "end_turn"),
             "stop_sequence": None,
         },
-        "usage": {"output_tokens": completion_tokens_estimate},
+        # Real usage when the provider volunteered it, otherwise the same
+        # rough chars/4 estimate /v1/messages/count_tokens uses. This used to
+        # report a count of SSE chunks, which is not a unit of anything.
+        "usage": {"output_tokens": _output_tokens(upstream_usage, text_chars)},
     })
     yield sse_event("message_stop", {"type": "message_stop"})
 
@@ -501,14 +644,42 @@ async def add_backend(request: Request):
 
 @app.patch("/api/backends/{name}")
 async def update_backend(name: str, request: Request):
+    """Partial update of one backend. Two conventions worth knowing:
+
+    - A blank api_key means "leave the stored key alone", because the browser
+      never has the key to send back -- an edit form with the key field left
+      empty must not wipe it. To actually clear a key, send null.
+    - 'name' may be changed here, so renaming a backend doesn't mean deleting
+      it and losing the key with it.
+
+    (This is the opposite of integrations.update, where blank clears. There the
+    field is shown as configured/not; here it is edited alongside fields that
+    are legitimately blank, so the safe reading of "" differs.)"""
     body = await request.json()
     for b in BACKENDS:
-        if b["name"] == name:
-            for field in ("base_url", "api_key", "big_model", "small_model"):
-                if field in body and body[field] is not None:
-                    b[field] = body[field]
-            save_backends()
-            return public_backend(b)
+        if b["name"] != name:
+            continue
+
+        new_name = body.get("name")
+        if isinstance(new_name, str) and new_name.strip() and new_name.strip() != name:
+            new_name = new_name.strip()
+            if any(other["name"] == new_name for other in BACKENDS):
+                raise HTTPException(status_code=409, detail=f"backend '{new_name}' already exists")
+            b["name"] = new_name
+
+        if "api_key" in body:
+            if body["api_key"] is None:
+                b["api_key"] = ""
+            elif isinstance(body["api_key"], str) and body["api_key"].strip():
+                b["api_key"] = body["api_key"].strip()
+
+        for field in ("base_url", "big_model", "small_model"):
+            if field in body and isinstance(body[field], str):
+                value = body[field].strip()
+                b[field] = value.rstrip("/") if field == "base_url" else value
+
+        save_backends()
+        return public_backend(b)
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
 
 
@@ -821,7 +992,7 @@ async def probe_models(request: Request):
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+        async with upstream_client(httpx.Timeout(15.0, connect=5.0)) as client:
             resp = await client.get(f"{base_url}/models", headers=headers)
     except httpx.HTTPError as e:
         return {"models": [], "error": str(e)}
@@ -938,7 +1109,11 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     # Without it, manual mode on a hundred-round review is a hundred prompts,
     # which is a mode nobody would leave switched on.
     approved_all = False
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    # Every tool-call id handed out during this message. Ids have to be unique
+    # across the whole run, not just within a round: the browser keys its tool
+    # cards by id, and approvals.create replaces an entry of the same name.
+    seen_call_ids = set()
+    async with upstream_client() as client:
         for _ in range(max_rounds):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
                 client, chain, conv, tools=tools)
@@ -954,9 +1129,10 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 started_on = used_backend
                 chain = reorder_chain_start(chain, used_backend)
 
-            message = data["choices"][0]["message"]
+            message = first_choice(data).get("message") or {}
             text = message.get("content") or ""
-            tool_calls = message.get("tool_calls") or []
+            tool_calls = [tc for tc in (message.get("tool_calls") or [])
+                          if isinstance(tc, dict) and (tc.get("function") or {}).get("name")]
 
             if text:
                 yield sse_data({"agent_text": text})
@@ -968,14 +1144,34 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 yield sse_data({"agent_done": True})
                 return
 
-            conv.append({"role": "assistant", "content": text or None, "tool_calls": tool_calls})
+            if len(tool_calls) > agent_tools.MAX_CALLS_PER_ROUND:
+                # max_rounds bounds rounds, not calls: a model that emits two
+                # hundred calls in one round would otherwise run all of them
+                # with no budget check in between.
+                dropped = tool_calls[agent_tools.MAX_CALLS_PER_ROUND:]
+                tool_calls = tool_calls[:agent_tools.MAX_CALLS_PER_ROUND]
+            else:
+                dropped = []
+
+            # Give every call a unique id *before* the assistant message goes
+            # into the history. The role:"tool" results below reference these
+            # ids, and a result whose tool_call_id appears nowhere in the
+            # preceding assistant message is a malformed conversation for every
+            # round after this one -- which is what happened whenever a provider
+            # omitted ids. Duplicates matter too: a provider that answers
+            # "call_1" every round collides in the browser's card map and in the
+            # approval registry.
+            for tc in tool_calls + dropped:
+                if not tc.get("id") or tc["id"] in seen_call_ids:
+                    tc["id"] = f"call_{uuid.uuid4().hex[:12]}"
+                seen_call_ids.add(tc["id"])
+
+            conv.append({"role": "assistant", "content": text or None,
+                         "tool_calls": tool_calls + dropped})
             for tc in tool_calls:
                 name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"].get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
+                args = tool_args_dict(tc["function"].get("arguments"))
+                call_id = tc["id"]
                 yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
 
                 # Manual mode: stop here and wait for the browser before the
@@ -1043,6 +1239,18 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                                                      "lan": ctx.lan, "approval": ctx.approval},
                                     "workdirs_changed": True})
 
+            for tc in dropped:
+                # Over the per-round cap, but still answered: every tool_call in
+                # the assistant message needs a matching result or the next
+                # round is a malformed conversation.
+                refused = (f"[error] this round asked for {len(tool_calls) + len(dropped)} tool "
+                           f"calls; only the first {agent_tools.MAX_CALLS_PER_ROUND} were run. "
+                           "Ask for fewer at a time.")
+                yield sse_data({"agent_tool_result": {"id": tc["id"],
+                                                      "name": tc["function"]["name"],
+                                                      "output": refused}})
+                conv.append({"role": "tool", "tool_call_id": tc["id"], "content": refused})
+
         # Out of tool rounds. This is a pause, not a failure: ask once more
         # with no tools attached so the model reports where it got to, then
         # tell the UI it can offer to carry on. The conversation stays intact
@@ -1056,7 +1264,7 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
         data, _, _, _, _ = await call_chain_non_stream(client, chain, conv)
         final = ""
         if data is not None:
-            final = (data["choices"][0]["message"].get("content") or "").strip()
+            final = ((first_choice(data).get("message") or {}).get("content") or "").strip()
         if final:
             conv.append({"role": "assistant", "content": final})
             yield sse_data({"agent_text": final})
@@ -1090,7 +1298,7 @@ async def ui_chat(request: Request):
                                  media_type="text/event-stream")
 
     if stream:
-        client = httpx.AsyncClient()
+        client = upstream_client()
 
         async def gen():
             try:
@@ -1128,7 +1336,7 @@ async def ui_chat(request: Request):
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    async with upstream_client() as client:
         data, used_backend, used_model, error, hard_status = await call_chain_non_stream(client, chain, messages)
         if data is None:
             if hard_status:
@@ -1166,7 +1374,7 @@ async def count_tokens(request: Request):
 
 async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
     last_error = None
-    for backend in BACKENDS:
+    for backend in list(BACKENDS):   # snapshot -- see find_working_stream
         payload = build_openai_payload(body, backend)
         payload["stream"] = False
         url = f"{backend['base_url']}/chat/completions"
@@ -1194,7 +1402,7 @@ async def messages(request: Request):
     claude_model = body.get("model", "")
 
     if body.get("stream"):
-        client = httpx.AsyncClient()
+        client = upstream_client()
 
         async def gen():
             try:
@@ -1205,7 +1413,7 @@ async def messages(request: Request):
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    async with upstream_client() as client:
         nim_data, error_resp = await try_backends_non_stream(client, body)
         if error_resp is not None:
             return JSONResponse(status_code=error_resp.status_code, content={
