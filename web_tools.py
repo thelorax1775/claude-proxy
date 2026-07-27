@@ -43,7 +43,12 @@ MAX_BODY_BYTES = 2_000_000
 # Private, loopback and link-local destinations (169.254.169.254 and friends)
 # are refused unless the operator opts back in. Redirects are followed by
 # hand so a public URL can't bounce into one.
-ALLOW_PRIVATE = os.getenv("AGENT_WEB_ALLOW_PRIVATE", "").strip().lower() in ("1", "true", "yes")
+#
+# This env var is a ceiling, not a switch: with it unset no message can reach
+# a private address however the browser asks. With it set, the LAN toggle
+# below the composer decides per message, and still defaults to off. Same
+# shape as AGENT_ROUND_CEILING -- the server bounds what the UI may choose.
+ALLOW_PRIVATE_CEILING = os.getenv("AGENT_WEB_ALLOW_PRIVATE", "").strip().lower() in ("1", "true", "yes")
 MAX_REDIRECTS = 5
 
 SEARCH_PROVIDERS = ("brave", "tavily")
@@ -125,11 +130,19 @@ def _blocked_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
             or ip.is_multicast or ip.is_unspecified)
 
 
-async def _destination_error(url: httpx.URL) -> str:
+def lan_allowed(requested) -> bool:
+    """What one message actually gets: what the browser asked for, clamped by
+    what the operator permits. Anything the UI sends is a request, not a
+    decision -- an unauthenticated browser must not be able to widen its own
+    reach past the ceiling."""
+    return bool(requested) and ALLOW_PRIVATE_CEILING
+
+
+async def _destination_error(url: httpx.URL, allow_private: bool = False) -> str:
     """Empty string if this URL may be fetched, an [error] line if not. Every
     address the host resolves to is checked, so a name that answers with both
     a public and a private address is still refused."""
-    if ALLOW_PRIVATE:
+    if allow_private:
         return ""
     host = url.host
     if not host:
@@ -147,9 +160,14 @@ async def _destination_error(url: httpx.URL) -> str:
         except ValueError:
             continue
         if _blocked_address(ip):
+            # Two different fixes depending on which gate is shut, so the
+            # message never sends someone to a switch that can't help them.
+            hint = ("Turn on the LAN switch below the composer if that is genuinely what you "
+                    "want it to reach." if ALLOW_PRIVATE_CEILING else
+                    "Set AGENT_WEB_ALLOW_PRIVATE=1 on the proxy to allow the LAN switch to "
+                    "enable this.")
             return (f"[error] refusing to fetch {host}: it resolves to {ip}, which is on this "
-                    "machine's own network. Set AGENT_WEB_ALLOW_PRIVATE=1 on the proxy if that "
-                    "is genuinely what you want it to reach.")
+                    f"machine's own network. {hint}")
     return ""
 
 
@@ -166,8 +184,12 @@ async def _read_capped(resp) -> bytes:
     return b"".join(chunks)[:MAX_BODY_BYTES]
 
 
-async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT) -> str:
-    """Fetch a URL and return its readable text, prefixed with a source line."""
+async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT, allow_private: bool = False) -> str:
+    """Fetch a URL and return its readable text, prefixed with a source line.
+
+    allow_private opens up private/loopback/link-local destinations for this
+    call only. It defaults to off so any caller that hasn't thought about it
+    gets the safe behaviour; pass ctx.lan to honour the UI toggle."""
     try:
         max_chars = int(max_chars)
     except (TypeError, ValueError):
@@ -190,7 +212,7 @@ async def web_fetch(url: str, max_chars: int = OUTPUT_LIMIT) -> str:
         # otherwise a public URL could 302 straight to a private address.
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
             for _ in range(MAX_REDIRECTS + 1):
-                problem = await _destination_error(target)
+                problem = await _destination_error(target, allow_private)
                 if problem:
                     return problem
                 request = client.build_request("GET", target, headers=HEADERS)

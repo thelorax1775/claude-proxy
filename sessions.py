@@ -112,6 +112,7 @@ def create(title: str = "", **fields) -> dict:
         "model": fields.get("model", ""),
         "agent": bool(fields.get("agent", False)),
         "sandbox": bool(fields.get("sandbox", True)),
+        "lan": bool(fields.get("lan", False)),
         "workdirs": fields.get("workdirs", []),
         "groups": fields.get("groups", []),
         "messages": fields.get("messages", []),
@@ -126,7 +127,7 @@ def get(session_id: str) -> dict | None:
     return _read(session_id)
 
 
-UPDATABLE = ("title", "backend", "model", "agent", "sandbox", "workdirs", "groups", "messages", "events")
+UPDATABLE = ("title", "backend", "model", "agent", "sandbox", "lan", "workdirs", "groups", "messages", "events")
 
 
 def update(session_id: str, changes: dict) -> dict | None:

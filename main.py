@@ -25,6 +25,7 @@ import agent_tools
 import github_api
 import integrations
 import sessions
+import web_tools
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -534,8 +535,10 @@ async def reorder_backends(request: Request):
 
 @app.get("/api/settings")
 async def ui_settings():
-    """What the UI needs to describe agent mode. The toggles themselves are
-    the browser's call -- nothing here gates them."""
+    """What the UI needs to describe agent mode. The agent and sandbox
+    toggles are the browser's call; lan_available is the one thing here that
+    does bound a toggle, since reaching the local network is the operator's
+    decision rather than the browser's."""
     usable = agent_tools.available_groups()
     return {
         "max_agent_iterations": MAX_AGENT_ITERATIONS,
@@ -543,6 +546,10 @@ async def ui_settings():
         "tool_timeout": agent_tools.AGENT_TOOL_TIMEOUT,
         "default_workspace": agent_tools.AGENT_WORKSPACE,
         "clone_root": agent_tools.CLONE_ROOT,
+        # Whether the operator allows the LAN switch to do anything. The UI
+        # shows the switch either way, but locks it when this is false rather
+        # than offering a toggle that silently can't take effect.
+        "lan_available": web_tools.ALLOW_PRIVATE_CEILING,
         "groups": [
             {
                 "name": group,
@@ -843,7 +850,8 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     tool-call -> execute -> feed result back -> repeat until it answers with
     plain text or MAX_AGENT_ITERATIONS is hit. Each round still gets the same
     account-failover treatment as plain chat."""
-    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd}})
+    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
+                                      "lan": ctx.lan}})
     # The system prompt is rebuilt per message rather than kept in history, so
     # toggling the sandbox or changing directories takes effect immediately.
     conv = [{"role": "system", "content": agent_tools.agent_system_prompt(ctx)}]
@@ -915,7 +923,8 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 # github_clone can add a working directory mid-run; tell the UI
                 # so its directory list and scope chip stay honest.
                 if name == "github_clone" and not result.startswith("[error]"):
-                    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd},
+                    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
+                                                     "lan": ctx.lan},
                                     "workdirs_changed": True})
 
         # Out of tool rounds. This is a pause, not a failure: ask once more
@@ -958,7 +967,8 @@ async def ui_chat(request: Request):
 
     if body.get("agent"):
         ctx = agent_tools.build_agent_context(
-            body.get("workdirs"), body.get("sandbox", True), body.get("groups"))
+            body.get("workdirs"), body.get("sandbox", True), body.get("groups"),
+            body.get("lan", False))
         max_rounds = agent_tools.clamp_rounds(body.get("max_rounds"))
         return StreamingResponse(agent_loop_gen(chain, messages, started_on, ctx, max_rounds),
                                  media_type="text/event-stream")

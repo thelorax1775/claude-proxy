@@ -154,12 +154,14 @@ def public_workdir(d: dict) -> dict:
 class AgentContext:
     """What one agent-mode message may touch: an ordered list of working
     directories (the first is where bash starts), whether path confinement is
-    on, and which tool groups are in play."""
+    on, which tool groups are in play, and whether web_fetch may reach the
+    local network."""
 
-    def __init__(self, roots: list[str], sandbox: bool, groups: list[str]):
+    def __init__(self, roots: list[str], sandbox: bool, groups: list[str], lan: bool = False):
         self.roots = roots
         self.sandbox = sandbox
         self.groups = groups
+        self.lan = lan
 
     @property
     def cwd(self) -> str:
@@ -186,7 +188,8 @@ def available_groups() -> dict:
     }
 
 
-def build_agent_context(requested_paths, sandbox_requested: bool, requested_groups=None) -> AgentContext:
+def build_agent_context(requested_paths, sandbox_requested: bool, requested_groups=None,
+                        lan_requested: bool = False) -> AgentContext:
     """Map what the browser asked for onto directories and groups that are
     actually available. Unknown paths and unusable groups are dropped rather
     than trusted -- a session picks from the registry, it doesn't invent
@@ -210,7 +213,11 @@ def build_agent_context(requested_paths, sandbox_requested: bool, requested_grou
     asked = requested_groups if isinstance(requested_groups, list) else DEFAULT_GROUPS
     groups = [g for g in GROUPS if g in asked and usable.get(g)]
 
-    return AgentContext(roots, bool(sandbox_requested), groups)
+    # lan_allowed clamps the browser's request against AGENT_WEB_ALLOW_PRIVATE,
+    # so a request asking for the LAN when the operator hasn't allowed it just
+    # gets the ordinary refusal.
+    return AgentContext(roots, bool(sandbox_requested), groups,
+                        web_tools.lan_allowed(lan_requested))
 
 
 def resolve_agent_path(ctx: AgentContext, path: str) -> str:
@@ -614,7 +621,7 @@ async def run_github_create_pr(ctx, repo: str, title: str, head: str, base: str 
 # ---------------------------------------------------------------------------
 
 async def run_web_fetch(ctx, url: str) -> str:
-    return await web_tools.web_fetch(url, max_chars=AGENT_OUTPUT_LIMIT)
+    return await web_tools.web_fetch(url, max_chars=AGENT_OUTPUT_LIMIT, allow_private=ctx.lan)
 
 
 async def run_web_search(ctx, query: str, limit: int = 5) -> str:
@@ -823,6 +830,18 @@ def agent_system_prompt(ctx: AgentContext) -> str:
         )
     if ctx.allows("web"):
         lines.append("Use web_fetch/web_search for anything you'd otherwise be guessing about.")
+        if ctx.lan:
+            lines.append(
+                "The LAN switch is ON for this message: web_fetch may also reach private "
+                "addresses on this machine's own network -- routers, other containers, "
+                "internal dashboards. Only go there when the user's request is actually "
+                "about their network, and never scan or enumerate hosts they didn't name."
+            )
+        else:
+            lines.append(
+                "web_fetch reaches the public internet only; private and loopback "
+                "addresses are refused. Say so rather than trying to work around it."
+            )
 
     lines.append(
         "When you're done, reply with a short plain-text summary of what you did and "

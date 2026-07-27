@@ -118,9 +118,9 @@ function record(event) {
   store.events.push(event);
 }
 
-function sessionState(backend, model, agent, sandbox, groups) {
+function sessionState(backend, model, agent, sandbox, groups, lan) {
   return {
-    backend, model, agent, sandbox, groups,
+    backend, model, agent, sandbox, groups, lan,
     workdirs: selectedPaths(),
     messages: store.history,
     events: store.events,
@@ -185,10 +185,19 @@ export function sandboxOn() {
   return $("sandbox-mode").checked;
 }
 
+export function lanOn() {
+  return $("lan-mode").checked;
+}
+
 function syncToggles() {
   const sandboxToggle = $("sandbox-mode");
   const sandboxRow = $("sandbox-row");
+  const lanToggle = $("lan-mode");
+  const lanRow = $("lan-row");
   const on = agentOn();
+  // The server decides whether the LAN switch can do anything at all; with
+  // AGENT_WEB_ALLOW_PRIVATE unset it stays locked rather than pretending.
+  const lanAvailable = store.settings.lan_available !== false;
 
   // The sandbox switch only means anything while agent mode is on.
   sandboxToggle.disabled = !on;
@@ -198,6 +207,18 @@ function syncToggles() {
     ? "stay inside the selected directories"
     : "file tools may go anywhere on that machine";
 
+  // Same rule as sandbox, plus the operator's ceiling. A locked switch is
+  // forced off so what's on screen matches what the run will actually get.
+  if (!lanAvailable) lanToggle.checked = false;
+  lanToggle.disabled = !on || !lanAvailable;
+  lanRow.classList.toggle("is-locked", !on || !lanAvailable);
+  lanRow.classList.toggle("warn", on && lanAvailable && lanToggle.checked);
+  $("lan-note").textContent = !lanAvailable
+    ? "blocked on the proxy (AGENT_WEB_ALLOW_PRIVATE)"
+    : lanToggle.checked
+      ? "web_fetch may reach this machine's own network"
+      : "public internet only";
+
   const chip = $("mode-chip");
   chip.classList.toggle("is-hidden", !on);
   if (on) {
@@ -205,9 +226,10 @@ function syncToggles() {
     const primary = dirs[0] ? dirs[0].split("/").filter(Boolean).pop() || dirs[0] : "workspace";
     const extra = dirs.length > 1 ? ` +${dirs.length - 1}` : "";
     chip.classList.toggle("unsandboxed", !sandboxToggle.checked);
+    const lanBit = lanToggle.checked && lanAvailable ? " · LAN" : "";
     chip.textContent = sandboxToggle.checked
-      ? `agent · sandboxed · ${primary}${extra}`
-      : `agent · UNSANDBOXED · ${primary}${extra}`;
+      ? `agent · sandboxed · ${primary}${extra}${lanBit}`
+      : `agent · UNSANDBOXED · ${primary}${extra}${lanBit}`;
   }
   emit("mode");
 }
@@ -239,6 +261,7 @@ async function sendMessage() {
 
   const agent = agentOn();
   const sandbox = sandboxOn();
+  const lan = lanOn();
   const groups = selectedGroups();
 
   input.value = "";
@@ -246,7 +269,7 @@ async function sendMessage() {
   store.history.push({ role: "user", content: text });
   record({ t: "user", text });
   addMessage("user", text);
-  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups));
+  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups, lan));
 
   // Plain chat streams tokens into one bubble; agent mode emits whole
   // rounds, so its bubbles are created as events arrive.
@@ -279,6 +302,7 @@ async function sendMessage() {
       stream: true,
       agent,
       sandbox,
+      lan,
       groups,
       max_rounds: maxRounds(),
       workdirs: selectedPaths(),
@@ -301,14 +325,17 @@ async function sendMessage() {
 
     for await (const chunk of sseJson(resp)) {
       if (chunk.agent_context) {
-        const { roots, sandbox: sandboxed } = chunk.agent_context;
+        // lan here is what the server granted after clamping, which is not
+        // necessarily what the switch asked for -- show that, not the switch.
+        const { roots, sandbox: sandboxed, lan: lanGranted } = chunk.agent_context;
         // A clone during the run adds a directory -- refresh the panel so the
         // scope shown on screen matches what the model is actually using.
         if (chunk.workdirs_changed) emit("workdirs-stale");
-        const key = JSON.stringify([roots, sandboxed]);
+        const key = JSON.stringify([roots, sandboxed, lanGranted]);
         if (key !== lastContextKey) {
           lastContextKey = key;
-          const notice = `${sandboxed ? "Sandboxed" : "UNSANDBOXED"} agent run · ${roots.join(" · ")}`;
+          const notice = `${sandboxed ? "Sandboxed" : "UNSANDBOXED"} agent run · ${roots.join(" · ")}`
+            + (lanGranted ? " · LAN access on" : "");
           addNotice(notice);
           record({ t: "notice", text: notice });
         }
@@ -412,7 +439,7 @@ async function sendMessage() {
     inFlight = null;
     setBusy(false);
     input.focus();
-    await saveCurrent(sessionState(backend, model, agent, sandbox, groups));
+    await saveCurrent(sessionState(backend, model, agent, sandbox, groups, lan));
   }
 }
 
@@ -447,6 +474,9 @@ export function initChat() {
 
   $("agent-mode").checked = prefs.get("agent", false);
   $("sandbox-mode").checked = prefs.get("sandbox", true);
+  // Defaults to off: reaching the local network is the sort of thing you opt
+  // into per session, not something a remembered tick silently leaves on.
+  $("lan-mode").checked = prefs.get("lan", false);
   $("agent-mode").onchange = () => {
     prefs.set("agent", $("agent-mode").checked);
     syncToggles();
@@ -456,6 +486,10 @@ export function initChat() {
   };
   $("sandbox-mode").onchange = () => {
     prefs.set("sandbox", $("sandbox-mode").checked);
+    syncToggles();
+  };
+  $("lan-mode").onchange = () => {
+    prefs.set("lan", $("lan-mode").checked);
     syncToggles();
   };
 
