@@ -44,6 +44,10 @@
       <select id="chat-backend"></select>
       <select id="chat-model"></select>
       <button class="secondary-btn" id="clear-btn">Clear chat</button>
+      <label class="agent-toggle" title="Lets the model run shell commands and read/write files in a sandboxed workspace directory on this container. Off by default every page load -- turn on deliberately.">
+        <input type="checkbox" id="agent-mode">
+        Agent tools (bash/files in this container)
+      </label>
       <span class="hint" id="chat-hint"></span>
     </div>
     <div id="messages">

@@ -196,6 +196,18 @@ button {
   min-width: 160px;
 }
 
+.agent-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: help;
+  width: auto;
+}
+
+.agent-toggle input { width: auto; }
+
 #messages {
   flex: 1;
   overflow-y: auto;
@@ -231,6 +243,20 @@ button {
   font-size: 0.8rem;
   background: none;
   border: 1px dashed var(--border);
+}
+
+.bubble.tool {
+  align-self: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  max-width: 80ch;
+}
+
+.bubble.tool .tool-name {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 #composer {

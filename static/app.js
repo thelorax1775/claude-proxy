@@ -208,22 +208,31 @@ async function sendMessage() {
   }
   $("chat-hint").textContent = "";
 
+  const agentMode = $("agent-mode").checked;
   input.value = "";
   history.push({ role: "user", content: text });
   appendBubble("user", text);
-  const assistantBubble = appendBubble("assistant", "");
+
+  // Non-agent mode streams token deltas into one pre-made bubble. Agent mode
+  // creates bubbles as events arrive (text rounds and tool calls are each
+  // their own bubble), since it isn't a single token stream.
+  const assistantBubble = agentMode ? null : appendBubble("assistant", "");
+  const toolBubbles = {};
+  let agentTextParts = [];
+  let sawError = false;
 
   $("send-btn").disabled = true;
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Proxy-Key": proxyKey() },
-      body: JSON.stringify({ backend: backendName, model, messages: history, stream: true }),
+      body: JSON.stringify({ backend: backendName, model, messages: history, stream: true, agent: agentMode }),
     });
 
     if (!resp.ok || !resp.body) {
       const data = await resp.json().catch(() => ({}));
-      assistantBubble.textContent = `[error] ${data.detail || data.error || resp.status}`;
+      const msg = `[error] ${data.detail || data.error || resp.status}`;
+      if (assistantBubble) assistantBubble.textContent = msg; else appendBubble("assistant", msg);
       history.pop();
       return;
     }
@@ -246,31 +255,58 @@ async function sendMessage() {
         if (data === "[DONE]") continue;
         try {
           const chunk = JSON.parse(data);
+
           if (chunk.claude_proxy_switch) {
-            insertSystemNotice(assistantBubble,
-              `Switched to "${chunk.claude_proxy_switch}" (${chunk.claude_proxy_model}) after the previous backend ran out.`);
+            const notice = `Switched to "${chunk.claude_proxy_switch}" (${chunk.claude_proxy_model}) after the previous backend ran out.`;
+            if (assistantBubble) insertSystemNotice(assistantBubble, notice);
+            else appendBubble("system", notice);
             $("chat-backend").value = chunk.claude_proxy_switch;
             renderModelSelector();
             $("chat-model").value = chunk.claude_proxy_model;
             continue;
           }
+
+          if (chunk.agent_text) {
+            agentTextParts.push(chunk.agent_text);
+            appendBubble("assistant", chunk.agent_text);
+            continue;
+          }
+          if (chunk.agent_tool_call) {
+            const { id, name, arguments: args } = chunk.agent_tool_call;
+            const div = appendBubble("tool", `▶ ${name}(${JSON.stringify(args)})\n...running`);
+            toolBubbles[id] = div;
+            continue;
+          }
+          if (chunk.agent_tool_result) {
+            const { id, name, output } = chunk.agent_tool_result;
+            const div = toolBubbles[id];
+            const text2 = `▶ ${name} ->\n${output}`;
+            if (div) div.textContent = text2; else appendBubble("tool", text2);
+            continue;
+          }
+          if (chunk.agent_done) continue;
+
           if (chunk.error) {
-            full += `\n[error] ${chunk.error}`;
-            assistantBubble.textContent = full;
+            sawError = true;
+            appendBubble("assistant", `[error] ${chunk.error}`);
             continue;
           }
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
             full += delta;
-            assistantBubble.textContent = full;
+            if (assistantBubble) assistantBubble.textContent = full;
             $("messages").scrollTop = $("messages").scrollHeight;
           }
         } catch { /* ignore partial/non-JSON lines */ }
       }
     }
-    history.push({ role: "assistant", content: full });
+
+    const finalText = agentMode ? agentTextParts.join("\n") : full;
+    if (!sawError || finalText) history.push({ role: "assistant", content: finalText });
+    else history.pop();
   } catch (err) {
-    assistantBubble.textContent = `[error] ${err.message}`;
+    const msg = `[error] ${err.message}`;
+    if (assistantBubble) assistantBubble.textContent = msg; else appendBubble("assistant", msg);
     history.pop();
   } finally {
     $("send-btn").disabled = false;

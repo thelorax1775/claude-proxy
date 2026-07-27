@@ -35,6 +35,17 @@ bound it) in a browser for:
   falls through the rest of your configured backends (same conversation
   history, no error shown) and a small system note announces the switch --
   the dropdowns update to match, so your next message starts there directly.
+- **Agent tools (opt-in, off by default every page load)** -- check
+  "Agent tools" above the composer and the model can call `bash`,
+  `read_file`, `write_file`, and `list_dir`, all confined to a
+  `workspace/` directory on this container. Tool calls and their output
+  render as their own bubbles in the chat so you can see exactly what ran.
+  This is real command execution on whatever machine the proxy is deployed
+  to -- the actual safety boundary is the container itself (it runs as an
+  unprivileged system user, but a shell command isn't sandboxed beyond
+  that), so only turn this on somewhere disposable, and only requires a
+  tool-calling-capable model. This never touches `/v1/messages` -- Claude
+  Code's own tools are completely separate and unaffected.
 
 Everything here runs API keys through this local server only -- keys never
 leave the machine the proxy runs on except to reach the provider you picked.

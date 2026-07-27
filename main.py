@@ -8,6 +8,7 @@ backend that supports OpenAI-style function calling. Backends are tried
 in order; on rate limit (429) or error, the next one in the list is tried.
 """
 
+import asyncio
 import collections
 import json
 import logging
@@ -73,6 +74,147 @@ def record_attempt(backend_name: str, outcome: str):
     entry = {"time": time.time(), "backend": backend_name, "outcome": outcome}
     ATTEMPT_LOG.append(entry)
     log.info("backend=%s outcome=%s", backend_name, outcome)
+
+
+# ---------------------------------------------------------------------------
+# Agent tools -- only reachable from the web UI's chat when explicitly
+# opted into (never wired into /v1/messages -- Claude Code's own tools are
+# unaffected). Everything is confined to AGENT_WORKSPACE. The real safety
+# boundary is this container: it runs as the unprivileged `claude-proxy`
+# system user, but a shell command isn't sandboxed beyond that -- treat
+# this container as disposable, not as something holding anything you'd
+# mind an LLM having shell access to.
+# ---------------------------------------------------------------------------
+
+AGENT_WORKSPACE = os.path.abspath(os.getenv("AGENT_WORKSPACE", "workspace"))
+os.makedirs(AGENT_WORKSPACE, exist_ok=True)
+
+AGENT_TOOL_TIMEOUT = 30
+AGENT_OUTPUT_LIMIT = 8000
+MAX_AGENT_ITERATIONS = 8
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command in the sandboxed workspace directory on this container. Output (stdout+stderr combined) is truncated if large.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Shell command to run"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a text file's contents from the sandboxed workspace directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path relative to the workspace root"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write (create or overwrite) a text file in the sandboxed workspace directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the workspace root"},
+                    "content": {"type": "string", "description": "Full file content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List files and directories inside the sandboxed workspace (or a subdirectory of it).",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Subdirectory relative to workspace root; defaults to '.'"}},
+            },
+        },
+    },
+]
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= AGENT_OUTPUT_LIMIT:
+        return text
+    return text[:AGENT_OUTPUT_LIMIT] + f"\n...[truncated, {len(text)} bytes total]"
+
+
+def resolve_workspace_path(rel_path: str) -> str:
+    target = os.path.abspath(os.path.join(AGENT_WORKSPACE, rel_path or "."))
+    if target != AGENT_WORKSPACE and not target.startswith(AGENT_WORKSPACE + os.sep):
+        raise ValueError("path escapes the workspace directory")
+    return target
+
+
+async def run_bash(command: str) -> str:
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command, cwd=AGENT_WORKSPACE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TOOL_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return f"[error] command timed out after {AGENT_TOOL_TIMEOUT}s"
+        return _truncate(out.decode("utf-8", "replace"))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def run_read_file(path: str) -> str:
+    try:
+        target = resolve_workspace_path(path)
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            return _truncate(f.read())
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def run_write_file(path: str, content: str) -> str:
+    try:
+        target = resolve_workspace_path(path)
+        os.makedirs(os.path.dirname(target) or AGENT_WORKSPACE, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def run_list_dir(path: str = ".") -> str:
+    try:
+        target = resolve_workspace_path(path)
+        entries = sorted(os.listdir(target))
+        return "\n".join(entries) if entries else "(empty)"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def execute_tool_call(name: str, args: dict) -> str:
+    if name == "bash":
+        return await run_bash(args.get("command", ""))
+    if name == "read_file":
+        return run_read_file(args.get("path", ""))
+    if name == "write_file":
+        return run_write_file(args.get("path", ""), args.get("content", ""))
+    if name == "list_dir":
+        return run_list_dir(args.get("path", "."))
+    return f"[error] unknown tool '{name}'"
 
 
 def pick_model(claude_model: str, backend: dict) -> str:
@@ -593,6 +735,95 @@ def chat_fallback_chain(start_name: str, start_model: str):
     return chain
 
 
+def reorder_chain_start(chain, backend_name):
+    """After a fallback succeeds, put that backend first so the next loop
+    iteration doesn't waste a call re-trying the one that just failed."""
+    idx = next((i for i, (b, _) in enumerate(chain) if b["name"] == backend_name), 0)
+    return chain[idx:] + chain[:idx]
+
+
+async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tools=None):
+    """Try each (backend, model) in order with a single non-streaming call.
+    Returns (response_json, backend_name, model, error, hard_status).
+    hard_status is set (and error is the raw body) only for a non-retryable
+    upstream error -- callers should pass that straight through rather than
+    treat it as the whole chain being exhausted."""
+    last_error = None
+    for backend, model in chain:
+        payload = {"model": model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        url = f"{backend['base_url']}/chat/completions"
+        try:
+            resp = await client.post(url, headers=backend_headers(backend), json=payload)
+        except httpx.HTTPError as e:
+            record_attempt(backend["name"], f"connection error: {e}")
+            last_error = str(e)
+            continue
+        if resp.status_code in RETRYABLE_STATUS:
+            record_attempt(backend["name"], f"HTTP {resp.status_code}")
+            last_error = f"HTTP {resp.status_code}"
+            continue
+        if resp.status_code >= 400:
+            record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
+            return None, None, None, resp.text, resp.status_code
+        record_attempt(backend["name"], "ok")
+        return resp.json(), backend["name"], model, None, None
+    return None, None, None, last_error or "no backends configured", None
+
+
+def sse_data(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+async def agent_loop_gen(chain, messages, started_on):
+    """Agentic mode for the web UI only: lets the model call bash/file tools
+    scoped to AGENT_WORKSPACE on this container, looping tool-call ->
+    execute -> feed result back -> repeat until it answers with plain text
+    or MAX_AGENT_ITERATIONS is hit. Each round still gets the same
+    account-failover treatment as plain chat."""
+    conv = list(messages)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        for _ in range(MAX_AGENT_ITERATIONS):
+            data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
+                client, chain, conv, tools=AGENT_TOOLS)
+            if data is None:
+                prefix = f"HTTP {hard_status}" if hard_status else "all configured backends exhausted"
+                yield sse_data({"error": f"{prefix}: {error}"})
+                return
+            if used_backend != started_on:
+                yield sse_data({"claude_proxy_switch": used_backend, "claude_proxy_model": used_model})
+                started_on = used_backend
+                chain = reorder_chain_start(chain, used_backend)
+
+            message = data["choices"][0]["message"]
+            text = message.get("content") or ""
+            tool_calls = message.get("tool_calls") or []
+
+            if text:
+                yield sse_data({"agent_text": text})
+
+            if not tool_calls:
+                yield sse_data({"agent_done": True})
+                return
+
+            conv.append({"role": "assistant", "content": text or None, "tool_calls": tool_calls})
+            for tc in tool_calls:
+                name = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
+                yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
+                result = await execute_tool_call(name, args)
+                yield sse_data({"agent_tool_result": {"id": call_id, "name": name, "output": result}})
+                conv.append({"role": "tool", "tool_call_id": call_id, "content": result})
+
+        yield sse_data({"error": f"stopped after {MAX_AGENT_ITERATIONS} tool iterations without a final answer"})
+
+
 @app.post("/api/chat", dependencies=[Depends(require_proxy_key)])
 async def ui_chat(request: Request):
     """Manual test-chat UI. Starts with the backend/model the user picked;
@@ -608,6 +839,9 @@ async def ui_chat(request: Request):
     messages = body.get("messages", [])
     stream = bool(body.get("stream", True))
     started_on = chain[0][0]["name"]
+
+    if body.get("agent"):
+        return StreamingResponse(agent_loop_gen(chain, messages, started_on), media_type="text/event-stream")
 
     if stream:
         client = httpx.AsyncClient()
@@ -649,29 +883,15 @@ async def ui_chat(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        last_error = None
-        for backend, model in chain:
-            payload = {"model": model, "messages": messages, "stream": False}
-            url = f"{backend['base_url']}/chat/completions"
-            try:
-                resp = await client.post(url, headers=backend_headers(backend), json=payload)
-            except httpx.HTTPError as e:
-                record_attempt(backend["name"], f"connection error: {e}")
-                last_error = str(e)
-                continue
-            if resp.status_code in RETRYABLE_STATUS:
-                record_attempt(backend["name"], f"HTTP {resp.status_code}")
-                last_error = f"HTTP {resp.status_code}"
-                continue
-            if resp.status_code >= 400:
-                return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
-            record_attempt(backend["name"], "ok")
-            data = resp.json()
-            if backend["name"] != started_on:
-                data["claude_proxy_switch"] = backend["name"]
-                data["claude_proxy_model"] = model
-            return JSONResponse(content=data)
-        raise HTTPException(status_code=502, detail=f"all configured backends exhausted: {last_error}")
+        data, used_backend, used_model, error, hard_status = await call_chain_non_stream(client, chain, messages)
+        if data is None:
+            if hard_status:
+                return JSONResponse(status_code=hard_status, content={"error": error})
+            raise HTTPException(status_code=502, detail=f"all configured backends exhausted: {error}")
+        if used_backend != started_on:
+            data["claude_proxy_switch"] = used_backend
+            data["claude_proxy_model"] = used_model
+        return JSONResponse(content=data)
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

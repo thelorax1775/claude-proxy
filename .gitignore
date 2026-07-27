@@ -1,5 +1,6 @@
 .env
 backends.json
+workspace/
 __pycache__/
 *.pyc
 .venv/
