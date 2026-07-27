@@ -47,8 +47,11 @@ def scrub(text: str) -> str:
 async def request(method: str, path: str, *, params=None, json_body=None, accept: str | None = None):
     token = require_token()
     base = integrations.get("github_api")
+    # Classic PATs (ghp_*) use "token" prefix; fine-grained PATs (github_pat_*)
+    # and GitHub App tokens use "Bearer".
+    prefix = "token" if token.startswith("ghp_") else "Bearer"
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"{prefix} {token}",
         "Accept": accept or "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "claude-proxy",

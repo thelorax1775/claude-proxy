@@ -506,7 +506,12 @@ def _git_auth_args() -> list[str]:
     credential embedded in the remote URL, so the token never lands in
     .git/config on disk."""
     token = integrations.get("github_token")
-    return ["-c", f"http.extraHeader=Authorization: Bearer {token}"] if token else []
+    if not token:
+        return []
+    # Classic PATs (ghp_*) use "token" prefix; fine-grained PATs (github_pat_*)
+    # and GitHub App tokens use "Bearer".
+    prefix = "token" if token.startswith("ghp_") else "Bearer"
+    return ["-c", f"http.extraHeader=Authorization: {prefix} {token}"]
 
 
 def _repo_dir(ctx, path: str) -> str:
