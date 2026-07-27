@@ -253,6 +253,15 @@ a.icon-btn { text-decoration: none; display: inline-block; }
 .card.is-selected { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .card.is-missing { border-style: dashed; }
 
+/* The edit form that unfolds inside a backend card. Separated from the card's
+   summary rows by a rule so it reads as a panel rather than more card. */
+.edit-form {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+.edit-form .row { display: flex; gap: 0.4rem; align-items: center; }
+
 .tags { display: flex; gap: 0.3rem; flex-wrap: wrap; }
 
 .tag {

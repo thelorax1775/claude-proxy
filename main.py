@@ -97,6 +97,75 @@ def record_attempt(backend_name: str, outcome: str):
 
 
 # ---------------------------------------------------------------------------
+# Cooldown. Without it, a backend that just answered 429 goes straight back to
+# the front of the chain on the very next request, so every request re-pays
+# the rate limit before falling through. A dead key is worse: it fails every
+# request forever, at the cost of a round trip each time.
+#
+# In memory only. A restart clearing it is correct -- the reason to skip a
+# backend is something that just happened, not something worth persisting.
+# ---------------------------------------------------------------------------
+
+BACKEND_COOLDOWN = int(os.getenv("BACKEND_COOLDOWN", "60"))
+# Longer, because a rejected key does not come back in a minute the way a
+# rate limit does.
+BACKEND_AUTH_COOLDOWN = int(os.getenv("BACKEND_AUTH_COOLDOWN", "300"))
+
+# backend name -> monotonic time when it may be tried again
+_COOLDOWN: dict[str, float] = {}
+
+
+def cool_down(backend_name: str, seconds: float) -> None:
+    if seconds > 0:
+        _COOLDOWN[backend_name] = max(_COOLDOWN.get(backend_name, 0.0),
+                                      time.monotonic() + seconds)
+
+
+def cooling_for(backend_name: str) -> int:
+    """Seconds until this backend is worth trying again; 0 when it is now."""
+    remaining = _COOLDOWN.get(backend_name, 0.0) - time.monotonic()
+    if remaining <= 0:
+        _COOLDOWN.pop(backend_name, None)
+        return 0
+    return int(remaining) + 1
+
+
+def clear_cooldown(backend_name: str) -> None:
+    _COOLDOWN.pop(backend_name, None)
+
+
+def _retry_after(resp) -> float:
+    """Honour the provider's own Retry-After when it sends one -- it knows
+    better than our default does."""
+    raw = resp.headers.get("retry-after") if resp is not None else None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def note_failure(backend_name: str, status: int, resp=None) -> None:
+    """Record a failed attempt and put the backend on the bench for a while."""
+    record_attempt(backend_name, f"HTTP {status}")
+    if status in (401, 403):
+        cool_down(backend_name, BACKEND_AUTH_COOLDOWN)
+    elif status in RETRYABLE_STATUS:
+        cool_down(backend_name, _retry_after(resp) or BACKEND_COOLDOWN)
+
+
+def usable_backends(items, name_of):
+    """`items` minus anything currently cooling down. If that would leave
+    nothing, every one of them is returned instead: an answer from an
+    over-quota account beats no answer at all, and the whole point of the
+    chain is that it doesn't dead-end."""
+    usable = [i for i in items if not cooling_for(name_of(i))]
+    if usable or not items:
+        return usable
+    record_attempt("(chain)", "every backend cooling down -- trying anyway")
+    return list(items)
+
+
+# ---------------------------------------------------------------------------
 # Agent mode lives in agent_tools.py: the working-directory registry, the
 # tool implementations, and the group registry that decides what a run may
 # call. Only the loop that drives it stays here, since that needs the
@@ -385,7 +454,7 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
     last_error = None
     # Snapshot: this loop spans awaits, and deleting or reordering a backend
     # from the UI mid-request would otherwise silently skip the next entry.
-    for backend in list(BACKENDS):
+    for backend in usable_backends(list(BACKENDS), lambda b: b["name"]):
         payload = build_openai_payload(body, backend)
         payload["stream"] = True
         url = f"{backend['base_url']}/chat/completions"
@@ -395,12 +464,13 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
             resp = await client.send(req, stream=True)
         except httpx.HTTPError as e:
             record_attempt(backend["name"], f"connection error: {e}")
+            cool_down(backend["name"], BACKEND_COOLDOWN)
             last_error = str(e)
             continue
         if resp.status_code in RETRYABLE_STATUS:
             body_text = (await resp.aread()).decode("utf-8", "replace")
+            note_failure(backend["name"], resp.status_code, resp)
             await resp.aclose()
-            record_attempt(backend["name"], f"HTTP {resp.status_code}")
             last_error = f"HTTP {resp.status_code}: {body_text[:300]}"
             continue
         if resp.status_code >= 400:
@@ -409,6 +479,7 @@ async def find_working_stream(client: httpx.AsyncClient, body: dict):
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, None, f"HTTP {resp.status_code}: {body_text[:300]}"
         record_attempt(backend["name"], "ok")
+        clear_cooldown(backend["name"])
         return resp, backend, None
     return None, None, last_error or "no backends configured"
 
@@ -595,8 +666,14 @@ async def health():
 
 @app.get("/status")
 async def status():
-    """Recent backend attempts -- watch failover happen in real time."""
-    return {"recent_attempts": list(ATTEMPT_LOG)}
+    """Recent backend attempts -- watch failover happen in real time -- plus
+    which backends are currently benched and for how long, so a backend that
+    has quietly dropped out of the chain is visible rather than mysterious."""
+    return {
+        "recent_attempts": list(ATTEMPT_LOG),
+        "cooling": {b["name"]: cooling_for(b["name"]) for b in BACKENDS
+                    if cooling_for(b["name"])},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +688,10 @@ def public_backend(b: dict) -> dict:
         "big_model": b.get("big_model", ""),
         "small_model": b.get("small_model", ""),
         "has_key": bool(b.get("api_key")),
+        # Seconds until this one is back in the chain, 0 when it's in it now.
+        # Without this a backend simply vanishes from the failover order with
+        # no way to see why.
+        "cooling": cooling_for(b["name"]),
     }
 
 
@@ -665,6 +746,7 @@ async def update_backend(name: str, request: Request):
             new_name = new_name.strip()
             if any(other["name"] == new_name for other in BACKENDS):
                 raise HTTPException(status_code=409, detail=f"backend '{new_name}' already exists")
+            clear_cooldown(name)   # cooldown is keyed by name; don't strand it
             b["name"] = new_name
 
         if "api_key" in body:
@@ -672,6 +754,10 @@ async def update_backend(name: str, request: Request):
                 b["api_key"] = ""
             elif isinstance(body["api_key"], str) and body["api_key"].strip():
                 b["api_key"] = body["api_key"].strip()
+                # Someone replacing a key has just fixed the reason it was
+                # benched; making them wait out the auth cooldown would be
+                # absurd.
+                clear_cooldown(b["name"])
 
         for field in ("base_url", "big_model", "small_model"):
             if field in body and isinstance(body[field], str):
@@ -688,6 +774,7 @@ async def delete_backend(name: str):
     for i, b in enumerate(BACKENDS):
         if b["name"] == name:
             del BACKENDS[i]
+            clear_cooldown(name)
             save_backends()
             return {"ok": True}
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
@@ -984,6 +1071,19 @@ async def probe_models(request: Request):
     body = await request.json()
     base_url = (body.get("base_url") or "").strip().rstrip("/")
     api_key = body.get("api_key") or ""
+
+    # For a backend that already exists, the browser has no key to send -- the
+    # API never gives one back. Naming the backend lets the server use the
+    # stored key, which is what makes "Detect models" work when editing rather
+    # than only when adding.
+    saved_name = (body.get("name") or "").strip()
+    if saved_name:
+        backend = next((b for b in BACKENDS if b["name"] == saved_name), None)
+        if backend is None:
+            return {"models": [], "error": f"backend '{saved_name}' not found"}
+        base_url = base_url or (backend.get("base_url") or "").rstrip("/")
+        api_key = api_key or backend.get("api_key", "")
+
     if not base_url:
         return {"models": [], "error": "base_url is required"}
 
@@ -1046,7 +1146,7 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
     upstream error -- callers should pass that straight through rather than
     treat it as the whole chain being exhausted."""
     last_error = None
-    for backend, model in chain:
+    for backend, model in usable_backends(chain, lambda pair: pair[0]["name"]):
         payload = {"model": model, "messages": messages, "stream": False}
         if tools:
             payload["tools"] = tools
@@ -1056,16 +1156,18 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
             resp = await client.post(url, headers=backend_headers(backend), json=payload)
         except httpx.HTTPError as e:
             record_attempt(backend["name"], f"connection error: {e}")
+            cool_down(backend["name"], BACKEND_COOLDOWN)
             last_error = str(e)
             continue
         if resp.status_code in RETRYABLE_STATUS:
-            record_attempt(backend["name"], f"HTTP {resp.status_code}")
+            note_failure(backend["name"], resp.status_code, resp)
             last_error = f"HTTP {resp.status_code}"
             continue
         if resp.status_code >= 400:
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, None, None, resp.text, resp.status_code
         record_attempt(backend["name"], "ok")
+        clear_cooldown(backend["name"])
         return resp.json(), backend["name"], model, None, None
     return None, None, None, last_error or "no backends configured", None
 
@@ -1302,7 +1404,7 @@ async def ui_chat(request: Request):
 
         async def gen():
             try:
-                for backend, model in chain:
+                for backend, model in usable_backends(chain, lambda pair: pair[0]["name"]):
                     payload = {"model": model, "messages": messages, "stream": True}
                     url = f"{backend['base_url']}/chat/completions"
                     req = client.build_request("POST", url, headers=backend_headers(backend),
@@ -1311,10 +1413,11 @@ async def ui_chat(request: Request):
                         resp = await client.send(req, stream=True)
                     except httpx.HTTPError as e:
                         record_attempt(backend["name"], f"connection error: {e}")
+                        cool_down(backend["name"], BACKEND_COOLDOWN)
                         continue
                     if resp.status_code in RETRYABLE_STATUS:
+                        note_failure(backend["name"], resp.status_code, resp)
                         await resp.aclose()
-                        record_attempt(backend["name"], f"HTTP {resp.status_code}")
                         continue
                     if resp.status_code >= 400:
                         err = (await resp.aread()).decode("utf-8", "replace")
@@ -1322,6 +1425,7 @@ async def ui_chat(request: Request):
                         yield f"data: {json.dumps({'error': err})}\n\n"
                         return
                     record_attempt(backend["name"], "ok")
+                    clear_cooldown(backend["name"])
                     if backend["name"] != started_on:
                         yield f"data: {json.dumps({'claude_proxy_switch': backend['name'], 'claude_proxy_model': model})}\n\n"
                     try:
@@ -1374,7 +1478,8 @@ async def count_tokens(request: Request):
 
 async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
     last_error = None
-    for backend in list(BACKENDS):   # snapshot -- see find_working_stream
+    # snapshot + cooldown filter -- see find_working_stream
+    for backend in usable_backends(list(BACKENDS), lambda b: b["name"]):
         payload = build_openai_payload(body, backend)
         payload["stream"] = False
         url = f"{backend['base_url']}/chat/completions"
@@ -1382,16 +1487,18 @@ async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
             resp = await client.post(url, headers=backend_headers(backend), json=payload)
         except httpx.HTTPError as e:
             record_attempt(backend["name"], f"connection error: {e}")
+            cool_down(backend["name"], BACKEND_COOLDOWN)
             last_error = str(e)
             continue
         if resp.status_code in RETRYABLE_STATUS:
-            record_attempt(backend["name"], f"HTTP {resp.status_code}")
+            note_failure(backend["name"], resp.status_code, resp)
             last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
             continue
         if resp.status_code >= 400:
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
             return None, resp
         record_attempt(backend["name"], "ok")
+        clear_cooldown(backend["name"])
         return resp.json(), None
     raise HTTPException(status_code=502, detail=f"all backends exhausted: {last_error}")
 

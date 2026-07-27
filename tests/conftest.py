@@ -63,12 +63,18 @@ import main  # noqa: E402  -- must follow _prepare_env()
 
 @pytest.fixture
 def app():
-    """The FastAPI app with BACKENDS reset to the fixture list, so a test that
-    adds or deletes a backend can't leak into the next one."""
-    main.BACKENDS[:] = [dict(b) for b in TEST_BACKENDS]
-    main.ATTEMPT_LOG.clear()
+    """The FastAPI app with all module-global state reset, so a test that adds
+    a backend, benches one, or fills the attempt log can't leak into the next
+    one. Cooldowns especially: a 429 in one test would otherwise take that
+    backend out of the chain for the next sixty seconds of the suite."""
+    def reset():
+        main.BACKENDS[:] = [dict(b) for b in TEST_BACKENDS]
+        main.ATTEMPT_LOG.clear()
+        main._COOLDOWN.clear()
+
+    reset()
     yield main
-    main.BACKENDS[:] = [dict(b) for b in TEST_BACKENDS]
+    reset()
 
 
 def sse(*chunks) -> str:
