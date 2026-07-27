@@ -86,6 +86,13 @@ def record_attempt(backend_name: str, outcome: str):
 # mind an LLM having shell access to.
 # ---------------------------------------------------------------------------
 
+# Server-side master switch, separate from the UI checkbox. The checkbox is
+# just what a given browser session asks for; this is whether the proxy
+# will ever honor that ask at all. Defaults OFF -- an operator has to
+# deliberately opt in via .env, same spirit as PROXY_SHARED_KEY defaulting
+# to no-auth-required rather than the reverse.
+AGENT_TOOLS_ENABLED = os.getenv("AGENT_TOOLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
 AGENT_WORKSPACE = os.path.abspath(os.getenv("AGENT_WORKSPACE", "workspace"))
 os.makedirs(AGENT_WORKSPACE, exist_ok=True)
 
@@ -593,6 +600,7 @@ async def health():
     return {
         "status": "ok",
         "backends": [b["name"] for b in BACKENDS],
+        "agent_tools_enabled": AGENT_TOOLS_ENABLED,
     }
 
 
@@ -841,6 +849,11 @@ async def ui_chat(request: Request):
     started_on = chain[0][0]["name"]
 
     if body.get("agent"):
+        if not AGENT_TOOLS_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="agent tools are disabled on this proxy -- set AGENT_TOOLS_ENABLED=true in .env and restart to enable",
+            )
         return StreamingResponse(agent_loop_gen(chain, messages, started_on), media_type="text/event-stream")
 
     if stream:

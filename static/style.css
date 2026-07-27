@@ -208,6 +208,11 @@ button {
 
 .agent-toggle input { width: auto; }
 
+.agent-toggle.disabled {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
 #messages {
   flex: 1;
   overflow-y: auto;

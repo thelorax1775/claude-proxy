@@ -35,17 +35,9 @@ bound it) in a browser for:
   falls through the rest of your configured backends (same conversation
   history, no error shown) and a small system note announces the switch --
   the dropdowns update to match, so your next message starts there directly.
-- **Agent tools (opt-in, off by default every page load)** -- check
-  "Agent tools" above the composer and the model can call `bash`,
-  `read_file`, `write_file`, and `list_dir`, all confined to a
-  `workspace/` directory on this container. Tool calls and their output
-  render as their own bubbles in the chat so you can see exactly what ran.
-  This is real command execution on whatever machine the proxy is deployed
-  to -- the actual safety boundary is the container itself (it runs as an
-  unprivileged system user, but a shell command isn't sandboxed beyond
-  that), so only turn this on somewhere disposable, and only requires a
-  tool-calling-capable model. This never touches `/v1/messages` -- Claude
-  Code's own tools are completely separate and unaffected.
+- **Agent tools** -- lets the model in the test chat actually run commands
+  and touch files on the container, off by default with a server-side kill
+  switch. See "Agent tools" below for how to turn it on and use it.
 
 Everything here runs API keys through this local server only -- keys never
 leave the machine the proxy runs on except to reach the provider you picked.
@@ -235,6 +227,62 @@ backend, the proxy buckets on the string:
 - everything else (sonnet, opus, default) -> that backend's `big_model`
 
 Change the mapping in `backends.json`, not in code.
+
+## Agent tools
+
+Lets the model in the web UI's test chat actually run shell commands and
+read/write files on the container -- separate from Claude Code, which
+already has its own tools and is unaffected by any of this. Off by
+default at two levels, both of which need to be true for it to run:
+
+1. **Server-side kill switch** -- `AGENT_TOOLS_ENABLED` in `.env`, default
+   `false`. This is the real gate: if it's off, the proxy rejects any
+   request asking for agent mode, full stop, regardless of what the
+   browser sends.
+2. **Per-session checkbox** -- "Agent tools" above the chat composer in
+   the web UI, unchecked on every page load (not saved to localStorage).
+   If the server-side switch is off, this checkbox shows disabled with an
+   explanation on hover; checking it does nothing until an operator turns
+   on the switch below.
+
+### Turning it on
+
+```bash
+# in .env, on whichever machine/container runs the proxy:
+AGENT_TOOLS_ENABLED=true
+```
+
+Then restart the proxy (`sudo systemctl restart claude-proxy` for a
+systemd deployment, or just re-run `start.sh`/`start.ps1` locally) --
+`.env` is only read at startup.
+
+### Using it
+
+1. Open the web UI, pick a backend + model that supports tool/function
+   calling (same requirement as everywhere else in this proxy).
+2. Check "Agent tools" above the composer.
+3. Ask for something that needs the container, e.g. "list the files in
+   your workspace" or "write a file called notes.txt with today's date in
+   it, then read it back to confirm."
+4. Watch the chat: assistant text, then a distinct bubble per tool call
+   showing the command/args and its real output, then the model's final
+   answer once it stops calling tools (capped at 8 tool-call rounds per
+   message before the proxy gives up and reports it wasn't able to finish).
+
+Four tools are available: `bash`, `read_file`, `write_file`, `list_dir`.
+All file/directory paths are confined to a `workspace/` directory (set by
+`AGENT_WORKSPACE` in `.env`, created automatically) -- attempts to read or
+write outside it are rejected. `bash` runs with that directory as its
+working directory, but a shell can still `cd` elsewhere or use absolute
+paths; the workspace confinement is a convenience for file tools, not a
+hard sandbox.
+
+**The real safety boundary is the container itself, not the workspace
+directory.** Commands run as whatever unprivileged system user the proxy
+process runs as (`claude-proxy` in the systemd deployment) -- there's no
+additional sandboxing beyond that. Only turn `AGENT_TOOLS_ENABLED` on for
+a deployment you'd be fine losing entirely; don't enable it on a container
+that holds anything you care about.
 
 ## The one thing that will actually break things
 

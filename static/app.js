@@ -318,5 +318,21 @@ $("proxy-key").addEventListener("change", () => {
   localStorage.setItem("proxyKey", $("proxy-key").value);
 });
 
+async function checkAgentToolsEnabled() {
+  try {
+    const resp = await fetch("/health");
+    const data = await resp.json();
+    const toggle = $("agent-mode");
+    const label = toggle.closest(".agent-toggle");
+    if (!data.agent_tools_enabled) {
+      toggle.checked = false;
+      toggle.disabled = true;
+      label.title = "Disabled on this server. An operator needs to set AGENT_TOOLS_ENABLED=true in .env and restart the proxy to turn this on.";
+      label.classList.add("disabled");
+    }
+  } catch { /* /health being briefly unreachable shouldn't break the page */ }
+}
+
 fillPresets();
 loadBackends();
+checkAgentToolsEnabled();
