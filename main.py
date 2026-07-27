@@ -17,7 +17,7 @@ import time
 import uuid
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -59,10 +59,6 @@ def save_backends():
         json.dump(BACKENDS, f, indent=2)
     os.replace(tmp, BACKENDS_PATH)
 
-# Optional: require the client (Claude Code) to send this exact key so the
-# proxy isn't wide open to anything that can reach the port.
-PROXY_SHARED_KEY = os.getenv("PROXY_SHARED_KEY", "")
-
 HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 # Status codes worth failing over on. 401/403 included because a dead/expired
@@ -79,36 +75,58 @@ def record_attempt(backend_name: str, outcome: str):
 # ---------------------------------------------------------------------------
 # Agent tools -- only reachable from the web UI's chat when explicitly
 # opted into (never wired into /v1/messages -- Claude Code's own tools are
-# unaffected). Everything is confined to AGENT_WORKSPACE. The real safety
-# boundary is this container: it runs as the unprivileged `claude-proxy`
-# system user, but a shell command isn't sandboxed beyond that -- treat
-# this container as disposable, not as something holding anything you'd
-# mind an LLM having shell access to.
+# unaffected).
+#
+# Agent mode, the sandbox, and the working directories are all controlled
+# from the UI at request time; there is no server-side switch to flip first
+# and no auth in front of the proxy. Whoever can reach the port can give the
+# model a shell on this machine, so what the proxy binds to (PROXY_HOST) is
+# the only thing limiting that -- keep it on localhost or a private network.
+#
+# "Sandboxed" means the file tools refuse any path outside the working
+# directories selected for the session, and bash starts in one of them. That
+# is a guardrail against a confused model, not a security boundary: a shell
+# command can still cd out or use absolute paths. The real boundary is the
+# container and the unprivileged user this proxy runs as -- treat it as
+# disposable, not as something holding anything you'd mind an LLM touching.
 # ---------------------------------------------------------------------------
 
-# Server-side master switch, separate from the UI checkbox. The checkbox is
-# just what a given browser session asks for; this is whether the proxy
-# will ever honor that ask at all. Defaults OFF -- an operator has to
-# deliberately opt in via .env, same spirit as PROXY_SHARED_KEY defaulting
-# to no-auth-required rather than the reverse.
-AGENT_TOOLS_ENABLED = os.getenv("AGENT_TOOLS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
-AGENT_WORKSPACE = os.path.abspath(os.getenv("AGENT_WORKSPACE", "workspace"))
+def norm_path(p: str) -> str:
+    """Absolute, ~-expanded, symlinks resolved. Resolving symlinks matters:
+    otherwise a link inside a working directory would defeat the confinement
+    check by pointing anywhere."""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
+
+
+AGENT_WORKSPACE = norm_path(os.getenv("AGENT_WORKSPACE", "workspace"))
 os.makedirs(AGENT_WORKSPACE, exist_ok=True)
 
-AGENT_TOOL_TIMEOUT = 30
-AGENT_OUTPUT_LIMIT = 8000
-MAX_AGENT_ITERATIONS = 8
+# Extra working directories added through the UI live here, so they survive a
+# restart the same way backends.json does.
+WORKDIRS_PATH = os.getenv("AGENT_DIRS_CONFIG", "workdirs.json")
+
+AGENT_TOOL_TIMEOUT = int(os.getenv("AGENT_TOOL_TIMEOUT", "30"))
+AGENT_OUTPUT_LIMIT = int(os.getenv("AGENT_OUTPUT_LIMIT", "8000"))
+MAX_AGENT_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "12"))
+
+# Directories never worth walking into during a search.
+SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+SEARCH_MAX_MATCHES = 200
+SEARCH_MAX_FILES = 5000
 
 AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run a shell command in the sandboxed workspace directory on this container. Output (stdout+stderr combined) is truncated if large.",
+            "description": "Run a shell command on this container. Runs in the session's primary working directory unless 'cwd' says otherwise. Output (stdout+stderr combined) is truncated if large.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string", "description": "Shell command to run"}},
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run"},
+                    "cwd": {"type": "string", "description": "Directory to run in; must be one of the session's working directories (or inside one) while sandboxed"},
+                },
                 "required": ["command"],
             },
         },
@@ -117,10 +135,12 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file's contents from the sandboxed workspace directory.",
+            "description": "Read a text file. Relative paths resolve against the primary working directory; absolute paths are allowed if they're inside a working directory.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Path relative to the workspace root"}},
+                "properties": {
+                    "path": {"type": "string", "description": "File path, relative or absolute"},
+                },
                 "required": ["path"],
             },
         },
@@ -129,11 +149,11 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write (create or overwrite) a text file in the sandboxed workspace directory.",
+            "description": "Write (create or overwrite) a text file, creating parent directories as needed.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to the workspace root"},
+                    "path": {"type": "string", "description": "File path, relative or absolute"},
                     "content": {"type": "string", "description": "Full file content to write"},
                 },
                 "required": ["path", "content"],
@@ -143,11 +163,45 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "list_dir",
-            "description": "List files and directories inside the sandboxed workspace (or a subdirectory of it).",
+            "name": "edit_file",
+            "description": "Replace an exact snippet of text in an existing file. Fails if the snippet is missing or appears more than once, so read the file first and quote enough context to be unique.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Subdirectory relative to workspace root; defaults to '.'"}},
+                "properties": {
+                    "path": {"type": "string", "description": "File path, relative or absolute"},
+                    "old_text": {"type": "string", "description": "Exact text to replace, including indentation"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List the files and directories inside a directory. Defaults to the primary working directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path; defaults to '.'"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Recursively search text files for a regular expression and return matching 'path:line: text' hits. Skips .git, node_modules and similar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Python regular expression to search for"},
+                    "path": {"type": "string", "description": "Directory to search under; defaults to '.'"},
+                    "file_glob": {"type": "string", "description": "Optional filename glob filter, e.g. '*.py'"},
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -160,17 +214,115 @@ def _truncate(text: str) -> str:
     return text[:AGENT_OUTPUT_LIMIT] + f"\n...[truncated, {len(text)} bytes total]"
 
 
-def resolve_workspace_path(rel_path: str) -> str:
-    target = os.path.abspath(os.path.join(AGENT_WORKSPACE, rel_path or "."))
-    if target != AGENT_WORKSPACE and not target.startswith(AGENT_WORKSPACE + os.sep):
-        raise ValueError("path escapes the workspace directory")
+def path_within(target: str, root: str) -> bool:
+    return target == root or target.startswith(root.rstrip(os.sep) + os.sep)
+
+
+# ---------------------------------------------------------------------------
+# Working directories -- the set of places agent mode is allowed to operate
+# in. The AGENT_WORKSPACE entry is always present and can't be removed;
+# everything else is added/removed from the UI and persisted to WORKDIRS_PATH.
+# ---------------------------------------------------------------------------
+
+def load_workdirs() -> list[dict]:
+    saved = []
+    if os.path.exists(WORKDIRS_PATH):
+        try:
+            with open(WORKDIRS_PATH) as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as e:
+            log.warning("could not read %s (%s) -- starting with the default workspace only", WORKDIRS_PATH, e)
+            raw = []
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, str):
+                item = {"path": item}
+            if not isinstance(item, dict) or not item.get("path"):
+                continue
+            path = norm_path(item["path"])
+            if path == AGENT_WORKSPACE or any(d["path"] == path for d in saved):
+                continue
+            saved.append({
+                "path": path,
+                "label": item.get("label") or os.path.basename(path) or path,
+                "default": False,
+            })
+    return [{"path": AGENT_WORKSPACE, "label": "workspace", "default": True}] + saved
+
+
+WORKDIRS = load_workdirs()
+
+
+def save_workdirs():
+    payload = [{"path": d["path"], "label": d["label"]} for d in WORKDIRS if not d["default"]]
+    tmp = f"{WORKDIRS_PATH}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, WORKDIRS_PATH)
+
+
+def public_workdir(d: dict) -> dict:
+    return {
+        "path": d["path"],
+        "label": d["label"],
+        "default": d["default"],
+        "exists": os.path.isdir(d["path"]),
+        "writable": os.access(d["path"], os.W_OK),
+    }
+
+
+class AgentContext:
+    """What one agent-mode message is allowed to touch: an ordered list of
+    working directories (the first is where bash starts) and whether path
+    confinement is on."""
+
+    def __init__(self, roots: list[str], sandbox: bool):
+        self.roots = roots
+        self.sandbox = sandbox
+
+    @property
+    def cwd(self) -> str:
+        for root in self.roots:
+            if os.path.isdir(root):
+                return root
+        return AGENT_WORKSPACE
+
+
+def build_agent_context(requested_paths, sandbox_requested: bool) -> AgentContext:
+    """Map what the browser asked for onto directories that are actually
+    registered. Unknown paths are ignored rather than trusted -- a session
+    picks from the list, it doesn't invent entries mid-request (add the
+    directory through /api/workdirs first)."""
+    registered = [d["path"] for d in WORKDIRS]
+    roots = []
+    for p in requested_paths or []:
+        if not isinstance(p, str):
+            continue
+        path = norm_path(p)
+        if path in registered and path not in roots:
+            roots.append(path)
+    if not roots:
+        roots = [AGENT_WORKSPACE]
+    return AgentContext(roots, bool(sandbox_requested))
+
+
+def resolve_agent_path(ctx: AgentContext, path: str) -> str:
+    raw = os.path.expanduser(path or ".")
+    target = norm_path(raw if os.path.isabs(raw) else os.path.join(ctx.cwd, raw))
+    if ctx.sandbox and not any(path_within(target, root) for root in ctx.roots):
+        raise ValueError(
+            f"'{path}' is outside this session's working directories "
+            f"({', '.join(ctx.roots)}) and the sandbox is on"
+        )
     return target
 
 
-async def run_bash(command: str) -> str:
+async def run_bash(ctx: AgentContext, command: str, cwd: str | None = None) -> str:
     try:
+        workdir = resolve_agent_path(ctx, cwd) if cwd else ctx.cwd
+        if not os.path.isdir(workdir):
+            return f"[error] working directory '{workdir}' does not exist"
         proc = await asyncio.create_subprocess_shell(
-            command, cwd=AGENT_WORKSPACE,
+            command, cwd=workdir,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         try:
@@ -178,50 +330,134 @@ async def run_bash(command: str) -> str:
         except asyncio.TimeoutError:
             proc.kill()
             return f"[error] command timed out after {AGENT_TOOL_TIMEOUT}s"
-        return _truncate(out.decode("utf-8", "replace"))
+        text = out.decode("utf-8", "replace")
+        status = "" if proc.returncode == 0 else f"[exit {proc.returncode}]\n"
+        return _truncate(status + (text or "(no output)"))
     except Exception as e:
         return f"[error] {e}"
 
 
-def run_read_file(path: str) -> str:
+def run_read_file(ctx: AgentContext, path: str) -> str:
     try:
-        target = resolve_workspace_path(path)
+        target = resolve_agent_path(ctx, path)
         with open(target, "r", encoding="utf-8", errors="replace") as f:
             return _truncate(f.read())
     except Exception as e:
         return f"[error] {e}"
 
 
-def run_write_file(path: str, content: str) -> str:
+def run_write_file(ctx: AgentContext, path: str, content: str) -> str:
     try:
-        target = resolve_workspace_path(path)
-        os.makedirs(os.path.dirname(target) or AGENT_WORKSPACE, exist_ok=True)
+        target = resolve_agent_path(ctx, path)
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"wrote {len(content)} bytes to {path}"
+        return f"wrote {len(content)} bytes to {target}"
     except Exception as e:
         return f"[error] {e}"
 
 
-def run_list_dir(path: str = ".") -> str:
+def run_edit_file(ctx: AgentContext, path: str, old_text: str, new_text: str) -> str:
     try:
-        target = resolve_workspace_path(path)
-        entries = sorted(os.listdir(target))
-        return "\n".join(entries) if entries else "(empty)"
+        target = resolve_agent_path(ctx, path)
+        with open(target, "r", encoding="utf-8") as f:
+            content = f.read()
+        if not old_text:
+            return "[error] old_text is required -- use write_file to create a file from scratch"
+        occurrences = content.count(old_text)
+        if occurrences == 0:
+            return "[error] old_text not found in the file -- read it again and quote the exact text"
+        if occurrences > 1:
+            return f"[error] old_text appears {occurrences} times -- include more surrounding context so it's unique"
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content.replace(old_text, new_text, 1))
+        return f"edited {target} (replaced {len(old_text)} bytes with {len(new_text)})"
     except Exception as e:
         return f"[error] {e}"
 
 
-async def execute_tool_call(name: str, args: dict) -> str:
+def run_list_dir(ctx: AgentContext, path: str = ".") -> str:
+    try:
+        target = resolve_agent_path(ctx, path)
+        entries = []
+        for name in sorted(os.listdir(target)):
+            full = os.path.join(target, name)
+            entries.append(f"{name}/" if os.path.isdir(full) else name)
+        return _truncate("\n".join(entries)) if entries else "(empty)"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def run_search_files(ctx: AgentContext, pattern: str, path: str = ".", file_glob: str = "") -> str:
+    try:
+        import fnmatch
+        import re
+
+        root = resolve_agent_path(ctx, path)
+        regex = re.compile(pattern)
+        hits = []
+        scanned = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS]
+            for name in sorted(filenames):
+                if file_glob and not fnmatch.fnmatch(name, file_glob):
+                    continue
+                scanned += 1
+                if scanned > SEARCH_MAX_FILES:
+                    hits.append(f"...[stopped after scanning {SEARCH_MAX_FILES} files]")
+                    return _truncate("\n".join(hits))
+                full = os.path.join(dirpath, name)
+                try:
+                    with open(full, "r", encoding="utf-8") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if regex.search(line):
+                                hits.append(f"{os.path.relpath(full, root)}:{lineno}: {line.rstrip()}")
+                                if len(hits) >= SEARCH_MAX_MATCHES:
+                                    hits.append(f"...[stopped at {SEARCH_MAX_MATCHES} matches]")
+                                    return _truncate("\n".join(hits))
+                except (OSError, UnicodeDecodeError):
+                    continue  # binary or unreadable -- not what this tool is for
+        return _truncate("\n".join(hits)) if hits else "(no matches)"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def execute_tool_call(ctx: AgentContext, name: str, args: dict) -> str:
     if name == "bash":
-        return await run_bash(args.get("command", ""))
+        return await run_bash(ctx, args.get("command", ""), args.get("cwd"))
     if name == "read_file":
-        return run_read_file(args.get("path", ""))
+        return run_read_file(ctx, args.get("path", ""))
     if name == "write_file":
-        return run_write_file(args.get("path", ""), args.get("content", ""))
+        return run_write_file(ctx, args.get("path", ""), args.get("content", ""))
+    if name == "edit_file":
+        return run_edit_file(ctx, args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
     if name == "list_dir":
-        return run_list_dir(args.get("path", "."))
+        return run_list_dir(ctx, args.get("path", "."))
+    if name == "search_files":
+        return run_search_files(ctx, args.get("pattern", ""), args.get("path", "."), args.get("file_glob", ""))
     return f"[error] unknown tool '{name}'"
+
+
+def agent_system_prompt(ctx: AgentContext) -> str:
+    dirs = "\n".join(f"- {p}" + ("  (primary -- bash starts here)" if p == ctx.cwd else "") for p in ctx.roots)
+    if ctx.sandbox:
+        scope = ("The file tools refuse any path outside those directories. If you need "
+                 "something elsewhere, say so instead of trying to work around it.")
+    else:
+        scope = ("The sandbox is OFF for this session: the file tools can reach anywhere "
+                 "on this machine. Stay inside the directories above unless the user "
+                 "clearly asks otherwise, and never touch system files casually.")
+    return (
+        "You are an agent with real tool access to the machine hosting this proxy.\n\n"
+        f"Working directories:\n{dirs}\n\n"
+        f"{scope}\n\n"
+        "Use the tools to check things rather than guessing: read files before editing "
+        "them, and verify a change landed after making it. Prefer edit_file over "
+        "rewriting a whole file. When you're done, reply with a short plain-text summary "
+        "of what you did and what you found."
+    )
 
 
 def pick_model(claude_model: str, backend: dict) -> str:
@@ -229,25 +465,6 @@ def pick_model(claude_model: str, backend: dict) -> str:
     if "haiku" in m:
         return backend["small_model"]
     return backend["big_model"]
-
-
-def check_auth(x_api_key: str | None, authorization: str | None):
-    if not PROXY_SHARED_KEY:
-        return
-    token = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
-    if token != PROXY_SHARED_KEY:
-        raise HTTPException(status_code=401, detail="invalid api key")
-
-
-async def require_proxy_key(x_proxy_key: str | None = Header(default=None, alias="X-Proxy-Key")):
-    """Gates the web UI's /api/* routes. Separate from check_auth (which
-    gates Claude Code's /v1/messages) because the browser can't send
-    Anthropic-style headers -- same PROXY_SHARED_KEY value, different header.
-    A no-op when PROXY_SHARED_KEY isn't set (e.g. localhost-only deployments)."""
-    if not PROXY_SHARED_KEY:
-        return
-    if x_proxy_key != PROXY_SHARED_KEY:
-        raise HTTPException(status_code=401, detail="invalid proxy key")
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +817,7 @@ async def health():
     return {
         "status": "ok",
         "backends": [b["name"] for b in BACKENDS],
-        "agent_tools_enabled": AGENT_TOOLS_ENABLED,
+        "agent_workspace": AGENT_WORKSPACE,
     }
 
 
@@ -625,12 +842,12 @@ def public_backend(b: dict) -> dict:
     }
 
 
-@app.get("/api/backends", dependencies=[Depends(require_proxy_key)])
+@app.get("/api/backends")
 async def list_backends():
     return {"backends": [public_backend(b) for b in BACKENDS]}
 
 
-@app.post("/api/backends", dependencies=[Depends(require_proxy_key)])
+@app.post("/api/backends")
 async def add_backend(request: Request):
     body = await request.json()
     name = (body.get("name") or "").strip()
@@ -653,7 +870,7 @@ async def add_backend(request: Request):
     return public_backend(entry)
 
 
-@app.patch("/api/backends/{name}", dependencies=[Depends(require_proxy_key)])
+@app.patch("/api/backends/{name}")
 async def update_backend(name: str, request: Request):
     body = await request.json()
     for b in BACKENDS:
@@ -666,7 +883,7 @@ async def update_backend(name: str, request: Request):
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
 
 
-@app.delete("/api/backends/{name}", dependencies=[Depends(require_proxy_key)])
+@app.delete("/api/backends/{name}")
 async def delete_backend(name: str):
     for i, b in enumerate(BACKENDS):
         if b["name"] == name:
@@ -676,7 +893,7 @@ async def delete_backend(name: str):
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")
 
 
-@app.post("/api/backends/reorder", dependencies=[Depends(require_proxy_key)])
+@app.post("/api/backends/reorder")
 async def reorder_backends(request: Request):
     body = await request.json()
     order = body.get("order") or []
@@ -688,7 +905,59 @@ async def reorder_backends(request: Request):
     return {"backends": [public_backend(b) for b in BACKENDS]}
 
 
-@app.post("/api/probe-models", dependencies=[Depends(require_proxy_key)])
+@app.get("/api/settings")
+async def ui_settings():
+    """What the UI needs to describe agent mode. The toggles themselves are
+    the browser's call -- nothing here gates them."""
+    return {
+        "max_agent_iterations": MAX_AGENT_ITERATIONS,
+        "tool_timeout": AGENT_TOOL_TIMEOUT,
+        "default_workspace": AGENT_WORKSPACE,
+        "tools": [t["function"]["name"] for t in AGENT_TOOLS],
+    }
+
+
+@app.get("/api/workdirs")
+async def list_workdirs():
+    return {"workdirs": [public_workdir(d) for d in WORKDIRS]}
+
+
+@app.post("/api/workdirs")
+async def add_workdir(request: Request):
+    body = await request.json()
+    raw = (body.get("path") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="path is required")
+    path = norm_path(raw)
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=400, detail=f"'{path}' is not a directory on the proxy's machine")
+    if any(d["path"] == path for d in WORKDIRS):
+        raise HTTPException(status_code=409, detail=f"'{path}' is already a working directory")
+
+    entry = {
+        "path": path,
+        "label": (body.get("label") or "").strip() or os.path.basename(path) or path,
+        "default": False,
+    }
+    WORKDIRS.append(entry)
+    save_workdirs()
+    return public_workdir(entry)
+
+
+@app.delete("/api/workdirs")
+async def delete_workdir(path: str):
+    target = norm_path(path)
+    for i, d in enumerate(WORKDIRS):
+        if d["path"] == target:
+            if d["default"]:
+                raise HTTPException(status_code=400, detail="the default workspace can't be removed")
+            del WORKDIRS[i]
+            save_workdirs()
+            return {"ok": True}
+    raise HTTPException(status_code=404, detail=f"'{target}' is not a registered working directory")
+
+
+@app.post("/api/probe-models")
 async def probe_models(request: Request):
     """Best-effort model discovery for the add-backend form. Never raises --
     the UI falls back to a free-text model field if this comes back empty."""
@@ -785,13 +1054,17 @@ def sse_data(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-async def agent_loop_gen(chain, messages, started_on):
+async def agent_loop_gen(chain, messages, started_on, ctx: AgentContext):
     """Agentic mode for the web UI only: lets the model call bash/file tools
-    scoped to AGENT_WORKSPACE on this container, looping tool-call ->
-    execute -> feed result back -> repeat until it answers with plain text
-    or MAX_AGENT_ITERATIONS is hit. Each round still gets the same
+    scoped to the session's working directories on this container, looping
+    tool-call -> execute -> feed result back -> repeat until it answers with
+    plain text or MAX_AGENT_ITERATIONS is hit. Each round still gets the same
     account-failover treatment as plain chat."""
-    conv = list(messages)
+    yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd}})
+    # The system prompt is rebuilt per message rather than kept in history, so
+    # toggling the sandbox or changing directories takes effect immediately.
+    conv = [{"role": "system", "content": agent_system_prompt(ctx)}]
+    conv += [m for m in messages if m.get("role") != "system"]
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for _ in range(MAX_AGENT_ITERATIONS):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
@@ -825,14 +1098,14 @@ async def agent_loop_gen(chain, messages, started_on):
                     args = {}
                 call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
                 yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
-                result = await execute_tool_call(name, args)
+                result = await execute_tool_call(ctx, name, args)
                 yield sse_data({"agent_tool_result": {"id": call_id, "name": name, "output": result}})
                 conv.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
         yield sse_data({"error": f"stopped after {MAX_AGENT_ITERATIONS} tool iterations without a final answer"})
 
 
-@app.post("/api/chat", dependencies=[Depends(require_proxy_key)])
+@app.post("/api/chat")
 async def ui_chat(request: Request):
     """Manual test-chat UI. Starts with the backend/model the user picked;
     on 429/401/403/5xx/connection error, transparently falls through the
@@ -849,12 +1122,8 @@ async def ui_chat(request: Request):
     started_on = chain[0][0]["name"]
 
     if body.get("agent"):
-        if not AGENT_TOOLS_ENABLED:
-            raise HTTPException(
-                status_code=403,
-                detail="agent tools are disabled on this proxy -- set AGENT_TOOLS_ENABLED=true in .env and restart to enable",
-            )
-        return StreamingResponse(agent_loop_gen(chain, messages, started_on), media_type="text/event-stream")
+        ctx = build_agent_context(body.get("workdirs"), body.get("sandbox", True))
+        return StreamingResponse(agent_loop_gen(chain, messages, started_on, ctx), media_type="text/event-stream")
 
     if stream:
         client = httpx.AsyncClient()
@@ -956,10 +1225,7 @@ async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):
 
 
 @app.post("/v1/messages")
-async def messages(request: Request, x_api_key: str | None = Header(default=None),
-                    authorization: str | None = Header(default=None)):
-    check_auth(x_api_key, authorization)
-
+async def messages(request: Request):
     body = await request.json()
     claude_model = body.get("model", "")
 

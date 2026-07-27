@@ -1,63 +1,128 @@
 <title>claude-proxy</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%236d4aff'/></svg>">
 <link rel="stylesheet" href="/static/style.css">
 
-<div id="app">
-  <div id="sidebar">
-    <label>Proxy key <span class="hint">(only needed if PROXY_SHARED_KEY is set on the server)</span>
-      <input id="proxy-key" type="password" placeholder="leave blank if not configured">
-    </label>
+<div class="app" id="app">
+  <header class="topbar">
+    <button class="icon-btn nav-toggle" id="nav-toggle" title="Show/hide the side panel" aria-label="Toggle side panel">&#9776;</button>
+    <div class="brand">claude<span>-proxy</span></div>
+    <div class="pills" id="status-pills"></div>
+    <div class="spacer"></div>
+  </header>
 
-    <h2>Backends (failover order)</h2>
-    <div id="backend-list"></div>
+  <aside class="panel" id="panel">
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="backends" role="tab">Backends</button>
+      <button class="tab" data-tab="agent" role="tab">Agent</button>
+      <button class="tab" data-tab="activity" role="tab">Activity</button>
+    </nav>
 
-    <h2>Add backend</h2>
-    <form class="add-form" id="add-form">
-      <label>Provider preset
-        <select id="preset-select"></select>
-      </label>
-      <div class="hint" id="preset-note"></div>
-      <label>Name
-        <input id="f-name" required placeholder="e.g. groq">
-      </label>
-      <label>Base URL
-        <input id="f-base-url" required placeholder="https://api.groq.com/openai/v1">
-      </label>
-      <label>API key <span class="hint">(blank is fine for local Ollama)</span>
-        <input id="f-api-key" type="password" placeholder="paste key here, never in chat">
-      </label>
-      <button type="button" class="secondary-btn" id="detect-btn">Detect models</button>
-      <div class="hint" id="detect-hint"></div>
-      <label>Default model
-        <input id="f-big-model" list="model-options" required placeholder="e.g. llama-3.3-70b-versatile">
-      </label>
-      <label>Fast model <span class="hint">(used for haiku-mapped calls)</span>
-        <input id="f-small-model" list="model-options" placeholder="defaults to Default model">
-      </label>
-      <datalist id="model-options"></datalist>
-      <button type="submit" class="primary-btn">Add backend</button>
-      <div class="hint error" id="add-error"></div>
-    </form>
-  </div>
+    <section class="tab-body" data-panel="backends">
+      <div class="section-head">
+        <h2>Failover order</h2>
+        <span class="hint">tried in order</span>
+      </div>
+      <div id="backend-list" class="stack"></div>
 
-  <div id="main">
-    <div id="chat-header">
-      <select id="chat-backend"></select>
-      <select id="chat-model"></select>
-      <button class="secondary-btn" id="clear-btn">Clear chat</button>
-      <label class="agent-toggle" title="Lets the model run shell commands and read/write files in a sandboxed workspace directory on this container. Off by default every page load -- turn on deliberately.">
-        <input type="checkbox" id="agent-mode">
-        Agent tools (bash/files in this container)
-      </label>
-      <span class="hint" id="chat-hint"></span>
+      <details class="disclosure" id="add-backend">
+        <summary>Add a backend</summary>
+        <form class="form" id="add-form">
+          <label>Provider preset
+            <select id="preset-select"></select>
+          </label>
+          <p class="hint" id="preset-note"></p>
+          <label>Name
+            <input id="f-name" required placeholder="e.g. groq" autocomplete="off">
+          </label>
+          <label>Base URL
+            <input id="f-base-url" required placeholder="https://api.groq.com/openai/v1" autocomplete="off">
+          </label>
+          <label>API key <span class="hint">blank is fine for local Ollama</span>
+            <input id="f-api-key" type="password" placeholder="paste here, never into chat" autocomplete="off">
+          </label>
+          <button type="button" class="ghost-btn" id="detect-btn">Detect models</button>
+          <p class="hint" id="detect-hint"></p>
+          <label>Default model
+            <input id="f-big-model" list="model-options" required placeholder="e.g. llama-3.3-70b-versatile" autocomplete="off">
+          </label>
+          <label>Fast model <span class="hint">used for haiku-mapped calls</span>
+            <input id="f-small-model" list="model-options" placeholder="defaults to the default model" autocomplete="off">
+          </label>
+          <datalist id="model-options"></datalist>
+          <button type="submit" class="primary-btn">Add backend</button>
+          <p class="hint error" id="add-error"></p>
+        </form>
+      </details>
+    </section>
+
+    <section class="tab-body is-hidden" data-panel="agent">
+      <div id="agent-status" class="callout"></div>
+
+      <div class="section-head">
+        <h2>Working directories</h2>
+        <span class="hint">ticked = in scope</span>
+      </div>
+      <div id="workdir-list" class="stack"></div>
+
+      <form class="form inline-form" id="add-workdir-form">
+        <label>Add a directory
+          <input id="f-workdir" placeholder="/home/you/projects/thing" autocomplete="off">
+        </label>
+        <label>Label <span class="hint">optional</span>
+          <input id="f-workdir-label" placeholder="defaults to the folder name" autocomplete="off">
+        </label>
+        <button type="submit" class="primary-btn">Add directory</button>
+        <p class="hint error" id="workdir-error"></p>
+      </form>
+
+      <div class="section-head">
+        <h2>Tools</h2>
+      </div>
+      <div id="tool-list" class="chips"></div>
+    </section>
+
+    <section class="tab-body is-hidden" data-panel="activity">
+      <div class="section-head">
+        <h2>Backend attempts</h2>
+        <button class="ghost-btn small" id="refresh-activity">Refresh</button>
+      </div>
+      <div id="activity-list" class="stack"></div>
+    </section>
+  </aside>
+
+  <main class="chat">
+    <div class="chat-top">
+      <select id="chat-backend" title="Backend to start this message on"></select>
+      <select id="chat-model" title="Model to use"></select>
+      <span class="mode-chip is-hidden" id="mode-chip"></span>
+      <div class="spacer"></div>
+      <button class="ghost-btn small" id="clear-btn">Clear chat</button>
     </div>
-    <div id="messages">
-      <div class="empty-state">Add a backend on the left, pick it above, and start chatting.</div>
+
+    <div class="messages" id="messages"></div>
+
+    <div class="composer-wrap">
+      <div class="toggles">
+        <label class="switch-row" id="agent-row" title="Lets the model run commands and read/write files on the machine hosting this proxy.">
+          <span class="switch"><input type="checkbox" id="agent-mode"><span class="slider"></span></span>
+          <span class="switch-text">Agent tools<em id="agent-note">shell + files on this machine</em></span>
+        </label>
+        <label class="switch-row" id="sandbox-row" title="Keeps the file tools inside the working directories you selected.">
+          <span class="switch"><input type="checkbox" id="sandbox-mode" checked><span class="slider"></span></span>
+          <span class="switch-text">Sandbox<em id="sandbox-note">stay inside the selected directories</em></span>
+        </label>
+        <div class="spacer"></div>
+        <button class="ghost-btn small" id="dirs-shortcut">Directories</button>
+      </div>
+
+      <div class="composer">
+        <textarea id="composer-input" rows="1" placeholder="Message&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
+        <button class="primary-btn" id="send-btn">Send</button>
+      </div>
+      <p class="hint" id="chat-hint"></p>
     </div>
-    <div id="composer">
-      <textarea id="composer-input" placeholder="Message... (Enter to send, Shift+Enter for newline)"></textarea>
-      <button class="primary-btn" id="send-btn">Send</button>
-    </div>
-  </div>
+  </main>
 </div>
 
-<script src="/static/app.js"></script>
+<script type="module" src="/static/js/main.js"></script>

@@ -5,11 +5,12 @@ translating between Anthropic's Messages API (what Claude Code speaks) and
 any OpenAI-compatible chat completions API -- with automatic failover
 across a list of backends.
 
-Everything the project needs is in this one repo -- `main.py` plus a
-handful of config/doc files. All state that's specific to your setup
-(API keys, which backends you use) lives in `backends.json`, which you
-create locally and which is gitignored -- it never gets committed, so
-cloning this repo is safe to do publicly.
+Everything the project needs is in this one repo -- `main.py`, a small
+static web UI, plus a handful of config/doc files. All state that's specific
+to your setup (API keys, which backends you use, which directories agent
+mode may touch) lives in `backends.json` and `workdirs.json`, which are
+created locally and gitignored -- they never get committed, so cloning this
+repo is safe to do publicly.
 
 **What this actually is:** Claude Code stays Claude Code (the CLI/tool-use
 harness). The *model* answering prompts is whichever backend in
@@ -20,27 +21,43 @@ models.
 ## Web UI
 
 Once the proxy is running, open `http://127.0.0.1:8082/` (or wherever you
-bound it) in a browser for:
+bound it) in a browser. The window is a side panel (Backends / Agent /
+Activity) next to a chat pane, with the agent and sandbox switches sitting
+directly above the composer where you actually use them.
 
-- **Backend management** -- pick a provider preset (or "Custom"), paste in
-  its API key, hit "Detect models" to pull the real model list from that
-  provider instead of typing model IDs by hand, and save. Reorder or
-  remove backends with the arrows/× on each card. This edits `backends.json`
-  for you -- no need to hand-edit JSON or paste keys into a chat transcript.
-- **A test chat** -- pick any configured backend + model from the dropdowns
-  and talk to it directly, with streaming responses (no Anthropic
-  translation -- this is a human talking to a provider, separate from how
-  Claude Code uses the proxy via `/v1/messages`). If that backend gets
-  rate-limited or its key dies mid-conversation, the chat transparently
-  falls through the rest of your configured backends (same conversation
-  history, no error shown) and a small system note announces the switch --
-  the dropdowns update to match, so your next message starts there directly.
-- **Agent tools** -- lets the model in the test chat actually run commands
-  and touch files on the container, off by default with a server-side kill
-  switch. See "Agent tools" below for how to turn it on and use it.
+- **Backends tab** -- pick a provider preset (or "Custom"), paste in its API
+  key, hit "Detect models" to pull the real model list from that provider
+  instead of typing model IDs by hand, and save. Reorder or remove backends
+  with the arrows/× on each card. This edits `backends.json` for you -- no
+  need to hand-edit JSON or paste keys into a chat transcript.
+- **Agent tab** -- the working directories agent mode may operate in. Add any
+  directory on the proxy's machine by path, tick the ones a session should
+  see, remove the ones it shouldn't. The first ticked directory is the
+  "primary" one: it's where `bash` starts and what relative paths resolve
+  against. The list persists in `workdirs.json`.
+- **Activity tab** -- the proxy's recent backend attempts, so you can watch
+  failover happen instead of inferring it from `curl /status`.
+- **Chat** -- pick any configured backend + model and talk to it directly,
+  with streaming responses (no Anthropic translation -- this is a human
+  talking to a provider, separate from how Claude Code uses the proxy via
+  `/v1/messages`). If that backend gets rate-limited or its key dies
+  mid-conversation, the chat transparently falls through the rest of your
+  configured backends (same conversation history, no error shown) and a small
+  note announces the switch -- the dropdowns update to match, so your next
+  message starts there directly. **Send** becomes **Stop** while a reply is
+  streaming.
+- **Agent tools / Sandbox switches** -- see "Agent tools" below.
 
 Everything here runs API keys through this local server only -- keys never
 leave the machine the proxy runs on except to reach the provider you picked.
+
+### No auth, by design
+
+There is no login and no shared key: anything that can reach the port can
+spend your API keys, and can switch on agent mode and get a shell on the
+machine running the proxy. `PROXY_HOST` is the only thing limiting that, so
+keep it on `127.0.0.1` or a private interface (e.g. a Tailscale IP). Don't
+expose this port to the internet.
 
 ## Prerequisites
 
@@ -132,7 +149,8 @@ chmod +x start.sh
 
 Binds to `PROXY_HOST:PROXY_PORT` (default `127.0.0.1:8082`) -- see
 `.env.example`. Stays localhost-only unless you deliberately widen it,
-since this proxy holds multiple API keys and has no auth by default.
+since this proxy holds multiple API keys, has no auth, and can hand the
+model a shell through the web UI.
 
 ## Linux deployment (systemd)
 
@@ -150,10 +168,10 @@ python3 -m venv .venv
 # 2. Config (both gitignored, never committed)
 cp .env.example .env
 cp backends.example.json backends.json
-# edit both: real backend keys/URLs in backends.json; PROXY_HOST/PORT and
-# PROXY_SHARED_KEY in .env -- if Claude Code runs on a DIFFERENT machine
-# than this box, set PROXY_HOST to 0.0.0.0 (or this box's Tailscale IP) and
-# set PROXY_SHARED_KEY, since anything beyond 127.0.0.1 has no auth otherwise
+# edit both: real backend keys/URLs in backends.json; PROXY_HOST/PORT in
+# .env -- if Claude Code runs on a DIFFERENT machine than this box, set
+# PROXY_HOST to this box's Tailscale/LAN IP. There's no auth in front of the
+# proxy, so only bind it to an interface you trust, never a public one.
 
 # 3. Dedicated unprivileged user (matches the unit's User=/Group=)
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin claude-proxy
@@ -230,59 +248,60 @@ Change the mapping in `backends.json`, not in code.
 
 ## Agent tools
 
-Lets the model in the web UI's test chat actually run shell commands and
-read/write files on the container -- separate from Claude Code, which
-already has its own tools and is unaffected by any of this. Off by
-default at two levels, both of which need to be true for it to run:
+Lets the model in the web UI's chat actually run shell commands and
+read/write files on the machine hosting the proxy -- separate from Claude
+Code, which already has its own tools and is unaffected by any of this.
+Everything about it is controlled from the UI; there's no env var to set
+first and no restart needed.
 
-1. **Server-side kill switch** -- `AGENT_TOOLS_ENABLED` in `.env`, default
-   `false`. This is the real gate: if it's off, the proxy rejects any
-   request asking for agent mode, full stop, regardless of what the
-   browser sends.
-2. **Per-session checkbox** -- "Agent tools" above the chat composer in
-   the web UI, unchecked on every page load (not saved to localStorage).
-   If the server-side switch is off, this checkbox shows disabled with an
-   explanation on hover; checking it does nothing until an operator turns
-   on the switch below.
+### The two switches
 
-### Turning it on
+Both sit above the composer and are remembered per browser:
 
-```bash
-# in .env, on whichever machine/container runs the proxy:
-AGENT_TOOLS_ENABLED=true
-```
+- **Agent tools** -- off means a plain chat with no tools at all. On means
+  each message can spend up to 12 tool rounds working before it answers.
+- **Sandbox** -- on (the default) confines the file tools to the working
+  directories ticked in the Agent tab: relative paths resolve against the
+  primary one, absolute paths outside them are refused. Off lets the file
+  tools reach anything the proxy's user can read or write.
 
-Then restart the proxy (`sudo systemctl restart claude-proxy` for a
-systemd deployment, or just re-run `start.sh`/`start.ps1` locally) --
-`.env` is only read at startup.
+### Working directories
+
+The Agent tab lists every directory agent mode may work in. `workspace/`
+(from `AGENT_WORKSPACE`, created automatically) is always there and can't be
+removed; add any other directory on the proxy's machine by typing its path.
+Tick the ones the current session should see -- the first ticked directory
+is the primary one, shown as `primary` on its card and used as `bash`'s
+working directory. The chip next to the model dropdown always shows the
+live state, e.g. `agent · sandboxed · myproject +1`.
+
+Added directories are stored in `workdirs.json` (gitignored) and survive a
+restart. Ticking is per browser, not shared.
 
 ### Using it
 
-1. Open the web UI, pick a backend + model that supports tool/function
-   calling (same requirement as everywhere else in this proxy).
-2. Check "Agent tools" above the composer.
-3. Ask for something that needs the container, e.g. "list the files in
-   your workspace" or "write a file called notes.txt with today's date in
-   it, then read it back to confirm."
-4. Watch the chat: assistant text, then a distinct bubble per tool call
-   showing the command/args and its real output, then the model's final
-   answer once it stops calling tools (capped at 8 tool-call rounds per
-   message before the proxy gives up and reports it wasn't able to finish).
+1. Pick a backend + model that supports tool/function calling (same
+   requirement as everywhere else in this proxy).
+2. Turn on **Agent tools**. Add and tick whichever directories the job needs.
+3. Ask for something that needs the machine, e.g. "read main.py and tell me
+   what the failover logic does", or "add a docstring to the top of
+   utils.py and show me the diff."
+4. Watch the chat: assistant text, then a collapsible card per tool call
+   showing the arguments and the real output (click to expand; failures
+   open themselves), then the final answer once it stops calling tools.
+   After 12 rounds without a final answer the proxy stops and says so.
 
-Four tools are available: `bash`, `read_file`, `write_file`, `list_dir`.
-All file/directory paths are confined to a `workspace/` directory (set by
-`AGENT_WORKSPACE` in `.env`, created automatically) -- attempts to read or
-write outside it are rejected. `bash` runs with that directory as its
-working directory, but a shell can still `cd` elsewhere or use absolute
-paths; the workspace confinement is a convenience for file tools, not a
-hard sandbox.
+Six tools are available: `bash`, `read_file`, `write_file`, `edit_file`,
+`list_dir`, `search_files`. Each message re-sends the current directories
+and sandbox state, so flipping a switch takes effect on the very next
+message -- there's no session to restart.
 
-**The real safety boundary is the container itself, not the workspace
-directory.** Commands run as whatever unprivileged system user the proxy
-process runs as (`claude-proxy` in the systemd deployment) -- there's no
-additional sandboxing beyond that. Only turn `AGENT_TOOLS_ENABLED` on for
-a deployment you'd be fine losing entirely; don't enable it on a container
-that holds anything you care about.
+**The real safety boundary is the machine itself, not the sandbox switch.**
+Even sandboxed, `bash` can `cd` elsewhere or use absolute paths -- the
+confinement is a guardrail for the file tools, not a jail. Commands run as
+whatever unprivileged system user the proxy process runs as (`claude-proxy`
+in the systemd deployment). Run this where you'd be fine losing whatever
+that user can touch.
 
 ## The one thing that will actually break things
 

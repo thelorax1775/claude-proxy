@@ -4,3 +4,4 @@ workspace/
 __pycache__/
 *.pyc
 .venv/
+workdirs.json
