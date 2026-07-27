@@ -282,21 +282,50 @@ restart. Ticking is per browser, not shared.
 Tools come in groups you tick in the Agent tab, so you can hand the model a
 shell without also handing it the ability to open pull requests:
 
-| group | tools |
-| --- | --- |
-| Shell | `bash` |
-| Files | `read_file`, `write_file`, `edit_file`, `list_dir`, `search_files` |
-| Git | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit`, `git_checkout`, `git_push` |
-| GitHub | `github_list_repos`, `github_clone`, `github_list_prs`, `github_read_pr`, `github_list_issues`, `github_read_issue` |
-| GitHub write | `github_create_issue`, `github_comment`, `github_create_pr` |
-| Web | `web_fetch`, `web_search` |
+| group | n | tools |
+| --- | --- | --- |
+| Shell | 1 | `bash` |
+| Files | 6 | `read_file`, `write_file`, `edit_file`, `list_dir`, `search_files`, `find_files` |
+| Files: move & delete | 2 | `move_file`, `delete_file` |
+| Git | 12 | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit`, `git_checkout`, `git_push`, `git_fetch`, `git_pull`, `git_show`, `git_stash`, `git_restore` |
+| GitHub | 11 | `github_list_repos`, `github_clone`, `github_list_prs`, `github_read_pr`, `github_list_issues`, `github_read_issue`, `github_ci`, `github_read_file`, `github_list_branches`, `github_search_code`, `github_read_commit` |
+| GitHub write | 7 | `github_create_issue`, `github_comment`, `github_create_pr`, `github_merge_pr`, `github_review_pr`, `github_close_issue`, `github_write_file` |
+| Web | 3 | `web_fetch`, `web_search`, `http_request` |
 
 Unticked groups aren't offered to the model at all, and are refused
-server-side if it invents a call anyway. **GitHub write is off by default** --
-those actions are publicly visible, so turning them on is deliberate. The
-GitHub groups only become available once a token is connected. Unticking
-*every* group is allowed and means what it says: no tools, so the message is
-an ordinary chat.
+server-side if it invents a call anyway. The GitHub groups only become
+available once a token is connected. Unticking *every* group is allowed and
+means what it says: no tools, so the message is an ordinary chat.
+
+**Two groups are off by default**, because they do things you can't take back:
+
+- **Files: move & delete** -- `delete_file` removes one file at a time and
+  refuses directories outright, so there's no recursive tree delete to get
+  wrong. Read and edit live in the ordinary Files group, so you can hand over
+  editing without handing over deletion.
+- **GitHub write** -- publicly visible actions. `github_merge_pr` and
+  `github_review_pr` are the two worth thinking about before ticking: an
+  approval can be what allows a merge.
+
+Things worth knowing about individual tools:
+
+- `find_files` matches file *names*; `search_files` matches file *contents*.
+  Both skip `.git`, `node_modules`, `.venv` and similar.
+- `read_file` takes `offset`/`limit` line numbers, so a file bigger than the
+  output budget can be paged through rather than silently truncated.
+- `git_pull` is **fast-forward only**. If the branches have diverged it says
+  so instead of starting a merge or rebase nobody is watching.
+- `git_restore` refuses to run without an explicit filename -- "restore
+  everything" would discard uncommitted work with no undo.
+- `github_read_file` and `github_read_commit` work without cloning, which is
+  much faster when you only want an opinion on one file.
+- `github_search_code` uses GitHub's search API, which **does not reliably
+  index private repositories**. On a private repo it returns no matches even
+  when the text is there; clone it and use `search_files` instead.
+- `http_request` is for APIs -- explicit method, headers and body, response
+  returned raw. `web_fetch` is for reading pages and strips markup. Both run
+  through the same redirect-checked destination guard, so both respect the
+  LAN switch.
 
 ### Tool rounds
 

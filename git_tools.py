@@ -217,3 +217,99 @@ async def git_push(cwd: str, remote: str = "origin", branch: str = "", config_ar
     if _failed(out):
         return out
     return f"pushed to {target}" + (f"\n{out}" if out else "")
+
+
+async def git_fetch(cwd: str, remote: str = "origin", config_args: list | None = None) -> str:
+    """Update remote-tracking refs without touching the working tree. Safe to
+    run at any time, which is why it's the one to reach for before deciding
+    whether a pull is even needed."""
+    remote = remote or "origin"
+    problem = check_name("remote", remote)
+    if problem:
+        return problem
+    out = await run_git(cwd, list(config_args or []) + ["fetch", "--prune", remote], timeout=120)
+    if _failed(out):
+        return out
+    # A fetch that found nothing prints nothing, which reads as a failure if
+    # it's handed back bare.
+    return f"fetched {remote}" + (f"\n{out}" if out else " (already up to date)")
+
+
+async def git_pull(cwd: str, remote: str = "origin", branch: str = "",
+                   config_args: list | None = None) -> str:
+    """Fast-forward only. A merge or rebase started by a model is how you end
+    up with a half-finished conflict state and no one watching, so a pull that
+    can't fast-forward is reported rather than attempted."""
+    remote = remote or "origin"
+    problem = check_name("remote", remote)
+    if problem:
+        return problem
+    args = ["pull", "--ff-only", remote]
+    if branch:
+        problem = check_name("branch", branch)
+        if problem:
+            return problem
+        args.append(branch)
+
+    out = await run_git(cwd, list(config_args or []) + args, timeout=120)
+    if _failed(out):
+        if "not possible to fast-forward" in out or "diverging" in out.lower():
+            return (out + "\n\n[note] the local branch has commits the remote doesn't, so this "
+                    "would need a merge or rebase. That's a decision for the user -- report it "
+                    "rather than forcing it.")
+        return out
+    return out or "already up to date"
+
+
+async def git_show(cwd: str, ref: str = "HEAD", stat_only: bool = False) -> str:
+    """One commit: message, author, and either its diff or just the file
+    list. stat_only exists because a big commit's full diff can eat an entire
+    tool-output budget on its own."""
+    ref = (ref or "HEAD").strip()
+    if ref.startswith("-"):
+        return f"[error] '{ref}' is not a valid ref"
+    args = ["show", "--stat" if stat_only else "--patch", ref]
+    out = await run_git(cwd, args)
+    if _failed(out):
+        return out
+    return out or f"(nothing to show for {ref})"
+
+
+async def git_stash(cwd: str, action: str = "list", message: str = "") -> str:
+    """push / pop / list / drop. Deliberately not 'clear' -- that discards
+    every stash at once with no undo."""
+    action = (action or "list").strip().lower()
+    if action not in ("push", "pop", "list", "drop"):
+        return f"[error] stash action '{action}' must be one of: push, pop, list, drop"
+
+    if action == "push":
+        args = ["stash", "push", "--include-untracked"]
+        if message:
+            args += ["-m", message]
+    else:
+        args = ["stash", action]
+
+    out = await run_git(cwd, args)
+    if _failed(out):
+        return out
+    if action == "list":
+        return out or "(no stashes)"
+    return out or f"stash {action} done"
+
+
+async def git_restore(cwd: str, path: str = "", staged: bool = False) -> str:
+    """Discard uncommitted changes. This destroys work that was never
+    committed, so it refuses to run without an explicit path -- 'restore
+    everything' should be a decision someone types out, not a default."""
+    if not (path or "").strip():
+        return ("[error] path is required -- restoring every file at once would discard "
+                "uncommitted work with no way back. Name the file(s) to restore.")
+    args = ["restore"]
+    if staged:
+        args.append("--staged")
+    args += ["--", path]
+    out = await run_git(cwd, args)
+    if _failed(out):
+        return out
+    what = "unstaged" if staged else "discarded local changes in"
+    return f"{what} {path}" + (f"\n{out}" if out else "")

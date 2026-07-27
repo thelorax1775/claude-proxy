@@ -7,11 +7,12 @@ import { store, on, emit, prefs } from "./store.js";
 
 const LABELS = {
   shell: ["Shell", "run commands with bash"],
-  files: ["Files", "read, write, edit and search files"],
-  git: ["Git", "status, diff, log, branch, commit, push"],
-  github: ["GitHub", "browse repos, PRs and issues, clone"],
-  github_write: ["GitHub write", "open issues, comment, open pull requests"],
-  web: ["Web", "fetch pages and search"],
+  files: ["Files", "read, write, edit, find and search files"],
+  files_write: ["Files: move & delete", "rename, move and delete files — not reversible"],
+  git: ["Git", "status, diff, log, branch, commit, push, pull, stash"],
+  github: ["GitHub", "browse repos, PRs, issues, branches, CI and code"],
+  github_write: ["GitHub write", "issues, comments, pull requests, reviews, merges"],
+  web: ["Web", "fetch pages, search, and call APIs"],
 };
 
 const NEEDS = {

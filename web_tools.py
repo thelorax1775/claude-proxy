@@ -360,3 +360,109 @@ async def web_search(query: str, provider: str, api_key: str, limit: int = 5) ->
 
     body = _format_results(results[:limit], title_key, snippet_key)
     return _truncate(_redact(body, api_key), OUTPUT_LIMIT)
+
+
+# ---------------------------------------------------------------------------
+# Generic HTTP
+# ---------------------------------------------------------------------------
+
+# No CONNECT/TRACE: neither does anything useful here, and TRACE reflects
+# request headers back, which is a nice way to leak an Authorization value
+# into a chat bubble.
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+
+
+def _header_error(headers) -> str:
+    if headers in (None, ""):
+        return ""
+    if not isinstance(headers, dict):
+        return "[error] headers must be an object of name -> value strings"
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            return "[error] every header name and value must be a string"
+        # A newline in either half lets one header become several -- request
+        # splitting. httpx catches most of it; refusing outright is cheaper
+        # than reasoning about which shapes it catches.
+        if "\n" in name or "\r" in name or "\n" in value or "\r" in value:
+            return f"[error] header '{name}' contains a line break"
+    return ""
+
+
+async def http_request(method: str, url: str, headers=None, body: str = "",
+                       max_chars: int = OUTPUT_LIMIT, allow_private: bool = False) -> str:
+    """One HTTP request with an explicit method, headers and body, returning
+    the status line, response headers and body as text.
+
+    web_fetch is for reading pages: it strips markup and only does GET. This
+    is for talking to an API, so nothing is interpreted -- the body comes back
+    as sent. The same destination guard applies, so it can't reach a private
+    address unless the LAN switch is on for this message."""
+    verb = (method or "GET").strip().upper()
+    if verb not in HTTP_METHODS:
+        return f"[error] method '{verb}' must be one of: {', '.join(HTTP_METHODS)}"
+
+    problem = _header_error(headers)
+    if problem:
+        return problem
+
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        max_chars = OUTPUT_LIMIT
+    if max_chars <= 0:
+        max_chars = OUTPUT_LIMIT
+
+    normalized, error = _normalize_url(url)
+    if error:
+        return error
+    try:
+        target = httpx.URL(normalized)
+    except httpx.InvalidURL as e:
+        return f"[error] {normalized} is not a usable url: {e}"
+
+    send_headers = dict(HEADERS)
+    send_headers.update(headers or {})
+    content = body.encode("utf-8") if body else None
+
+    resp = None
+    try:
+        # Same hand-followed redirect loop as web_fetch: every hop is checked
+        # before it's fetched, so a public URL can't bounce to a private one.
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
+            for _ in range(MAX_REDIRECTS + 1):
+                blocked = await _destination_error(target, allow_private)
+                if blocked:
+                    return blocked
+                request = client.build_request(verb, target, headers=send_headers, content=content)
+                resp = await client.send(request, stream=True)
+                if resp.has_redirect_location and resp.next_request is not None:
+                    target = resp.next_request.url
+                    await resp.aclose()
+                    resp = None
+                    continue
+                break
+            else:
+                return f"[error] too many redirects (more than {MAX_REDIRECTS}) requesting {url}"
+
+            if resp is None:
+                return f"[error] could not reach {url}"
+
+            try:
+                status = f"{resp.status_code} {resp.reason_phrase or ''}".strip()
+                shown = {k: v for k, v in resp.headers.items()
+                         if k.lower() in ("content-type", "content-length", "location",
+                                          "retry-after", "x-ratelimit-remaining")}
+                raw = await _read_capped(resp)
+                encoding = resp.encoding or "utf-8"
+            finally:
+                await resp.aclose()
+    except httpx.TimeoutException:
+        return f"[error] timed out after 20s requesting {target}"
+    except httpx.HTTPError as e:
+        return f"[error] could not reach {target}: {e}"
+
+    text = raw.decode(encoding, "replace").strip()
+    head = f"{verb} {target}\n{status}"
+    if shown:
+        head += "\n" + "\n".join(f"{k}: {v}" for k, v in shown.items())
+    return _truncate(f"{head}\n\n{text or '(empty body)'}", max_chars)

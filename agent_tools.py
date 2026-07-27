@@ -1,20 +1,24 @@
 """Agent mode: the working-directory registry, the tool implementations, and
 the registry that decides which tools a given run may call.
 
-Tools are grouped (shell / files / git / github / github_write / web) so a
-session can hand the model a shell without also handing it the ability to
-open pull requests. Groups the UI doesn't ask for are simply not sent to the
-model, and are refused server-side if it invents a call anyway.
+Tools are grouped (shell / files / files_write / git / github / github_write /
+web) so a session can hand the model a shell without also handing it the
+ability to delete files or open pull requests. Groups the UI doesn't ask for
+are simply not sent to the model, and are refused server-side if it invents a
+call anyway. The two groups that do something you can't take back --
+files_write and github_write -- are off by default.
 
 Nothing here is wired into /v1/messages -- Claude Code's own tools are
 untouched by any of this.
 """
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
 import re
+import shutil
 import sys
 
 import git_tools
@@ -67,9 +71,15 @@ def clamp_rounds(requested) -> int:
 SEARCH_TIMEOUT = AGENT_TOOL_TIMEOUT
 SEARCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_search.py")
 
-GROUPS = ["shell", "files", "git", "github", "github_write", "web"]
-# Everything except the group that can post to other people's repositories.
+GROUPS = ["shell", "files", "files_write", "git", "github", "github_write", "web"]
+# Everything except the two groups that do something you can't take back: post
+# to other people's repositories, and delete files.
 DEFAULT_GROUPS = ["shell", "files", "git", "github", "web"]
+
+# Directories find_files never walks into, matching file_search.py -- a hit
+# inside .git or node_modules is noise in both tools.
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+MAX_FIND_RESULTS = 300
 
 
 def _truncate(text: str) -> str:
@@ -181,6 +191,7 @@ def available_groups() -> dict:
     return {
         "shell": True,
         "files": True,
+        "files_write": True,
         "git": True,
         "github": has_github,
         "github_write": has_github,
@@ -279,13 +290,37 @@ async def run_bash(ctx, command: str, cwd: str = "") -> str:
         return f"[error] {e}"
 
 
-async def run_read_file(ctx, path: str) -> str:
+async def run_read_file(ctx, path: str, offset: int = 0, limit: int = 0) -> str:
+    """Whole file by default, or a line range. The range matters for files
+    bigger than the output budget: without it, everything past the cut is
+    simply unreachable, and the model has no way to ask for the rest."""
     try:
         target = resolve_agent_path(ctx, path)
+        try:
+            start = max(1, int(offset or 1))
+        except (TypeError, ValueError):
+            return f"[error] offset '{offset}' is not a line number"
+        try:
+            count = int(limit or 0)
+        except (TypeError, ValueError):
+            return f"[error] limit '{limit}' is not a number of lines"
+
         with open(target, "r", encoding="utf-8", errors="replace") as f:
-            # Scrubbed like every other tool's output: the file being read may
-            # well be this proxy's own integrations.json.
-            return github_api.scrub(_truncate(f.read()))
+            lines = f.readlines()
+        total = len(lines)
+        if total and start > total:
+            return f"[error] offset {start} is past the end of the file ({total} lines)"
+        end = total if count <= 0 else min(total, start - 1 + count)
+
+        # Scrubbed like every other tool's output: the file being read may
+        # well be this proxy's own integrations.json.
+        body = github_api.scrub(_truncate("".join(lines[start - 1:end])))
+        # The header only appears when the answer isn't the whole file, so an
+        # ordinary read still returns content the model can quote verbatim
+        # into edit_file without stripping anything first.
+        if start > 1 or end < total:
+            return f"[lines {start}-{end} of {total}]\n{body}"
+        return body
     except Exception as e:
         return f"[error] {e}"
 
@@ -368,6 +403,88 @@ async def run_search_files(ctx, pattern: str, path: str = ".", file_glob: str = 
     return github_api.scrub(_truncate(hits)) if hits else "(no matches)"
 
 
+async def run_find_files(ctx, pattern: str, path: str = ".") -> str:
+    """Match filenames, where search_files matches file contents. Between them
+    they cover both halves of "where is that thing" without dropping to bash.
+
+    No child process needed: this only reads directory entries and compares
+    names with fnmatch, so there's no model-supplied regex to backtrack. It
+    still runs in a thread, since a deep tree is a lot of syscalls."""
+    if not (pattern or "").strip():
+        return "[error] pattern is required, e.g. '*.py' or 'docker-compose*'"
+    try:
+        root = resolve_agent_path(ctx, path)
+    except Exception as e:
+        return f"[error] {e}"
+    if not os.path.isdir(root):
+        return f"[error] '{root}' is not a directory"
+
+    hits = []
+    capped = False
+
+    def walk():
+        nonlocal capped
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for name in sorted(filenames):
+                if not fnmatch.fnmatch(name, pattern):
+                    continue
+                hits.append(os.path.relpath(os.path.join(dirpath, name), root))
+                if len(hits) >= MAX_FIND_RESULTS:
+                    capped = True
+                    return
+
+    try:
+        await asyncio.to_thread(walk)
+    except OSError as e:
+        return f"[error] {e}"
+
+    if not hits:
+        return f"(no files matching '{pattern}' under {root})"
+    body = "\n".join(hits)
+    if capped:
+        body += f"\n...[stopped at {MAX_FIND_RESULTS} matches -- narrow the pattern or the path]"
+    return github_api.scrub(_truncate(body))
+
+
+async def run_move_file(ctx, source: str, destination: str) -> str:
+    try:
+        src = resolve_agent_path(ctx, source)
+        dst = resolve_agent_path(ctx, destination)
+        if not os.path.exists(src) and not os.path.islink(src):
+            return f"[error] '{src}' does not exist"
+        if os.path.exists(dst):
+            return f"[error] '{dst}' already exists -- moving onto it would overwrite it"
+        parent = os.path.dirname(dst)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # shutil.move rather than os.replace: a working directory and the
+        # clone root can be on different filesystems, where rename(2) fails.
+        await asyncio.to_thread(shutil.move, src, dst)
+        return f"moved {src} -> {dst}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_delete_file(ctx, path: str) -> str:
+    """One file at a time, never a directory. A model that has misunderstood
+    the task can delete a file and be corrected; a recursive tree delete is
+    not something anyone recovers from mid-conversation."""
+    try:
+        target = resolve_agent_path(ctx, path)
+        if os.path.isdir(target) and not os.path.islink(target):
+            return ("[error] that's a directory, and this tool only deletes single files. "
+                    "Delete the files individually if that's really what's wanted.")
+        if not os.path.exists(target) and not os.path.islink(target):
+            return f"[error] '{target}' does not exist"
+        if any(target == norm_path(root) for root in ctx.roots):
+            return f"[error] '{target}' is one of this session's working directories"
+        os.remove(target)
+        return f"deleted {target}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
 # ---------------------------------------------------------------------------
 # git
 # ---------------------------------------------------------------------------
@@ -432,6 +549,46 @@ async def run_git_push(ctx, path: str = "", remote: str = "origin", branch: str 
     try:
         return github_api.scrub(await git_tools.git_push(
             _repo_dir(ctx, path), remote=remote, branch=branch, config_args=_git_auth_args()))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_git_fetch(ctx, path: str = "", remote: str = "origin") -> str:
+    try:
+        return github_api.scrub(await git_tools.git_fetch(
+            _repo_dir(ctx, path), remote=remote, config_args=_git_auth_args()))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_git_pull(ctx, path: str = "", remote: str = "origin", branch: str = "") -> str:
+    try:
+        return github_api.scrub(await git_tools.git_pull(
+            _repo_dir(ctx, path), remote=remote, branch=branch, config_args=_git_auth_args()))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_git_show(ctx, ref: str = "HEAD", path: str = "", stat_only: bool = False) -> str:
+    try:
+        return github_api.scrub(await git_tools.git_show(
+            _repo_dir(ctx, path), ref=ref or "HEAD", stat_only=bool(stat_only)))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_git_stash(ctx, action: str = "list", path: str = "", message: str = "") -> str:
+    try:
+        return github_api.scrub(await git_tools.git_stash(
+            _repo_dir(ctx, path), action=action or "list", message=message or ""))
+    except Exception as e:
+        return f"[error] {e}"
+
+
+async def run_git_restore(ctx, file: str, path: str = "", staged: bool = False) -> str:
+    try:
+        return github_api.scrub(await git_tools.git_restore(
+            _repo_dir(ctx, path), path=file, staged=bool(staged)))
     except Exception as e:
         return f"[error] {e}"
 
@@ -616,12 +773,146 @@ async def run_github_create_pr(ctx, repo: str, title: str, head: str, base: str 
         return f"[error] {e}"
 
 
+async def run_github_ci(ctx, repo: str, branch: str = "", limit: int = 10) -> str:
+    """Recent workflow runs. 'conclusion' is the answer to "is it green" --
+    'status' only says whether it has finished."""
+    try:
+        runs = await github_api.list_workflow_runs(repo, branch=branch or "", limit=int(limit or 10))
+        if not runs:
+            return "(no workflow runs)" + (f" on branch {branch}" if branch else "")
+        lines = []
+        for r in runs:
+            outcome = r.get("conclusion") or r.get("status") or "unknown"
+            lines.append(
+                f"{outcome:<12} {r.get('name') or '(unnamed)'} · {r.get('head_branch') or '?'} · "
+                f"{(r.get('head_sha') or '')[:7]} · {r.get('created_at') or ''}"
+            )
+        return _truncate("\n".join(lines))
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_read_file(ctx, repo: str, path: str, ref: str = "") -> str:
+    """Read one file straight from GitHub. Cloning a whole repository to look
+    at a single file is the slow way round, especially for a repo the user
+    only wants an opinion on."""
+    try:
+        content = await github_api.get_content(repo, path, ref=ref or "")
+        if not isinstance(content, str):
+            return "[error] that path is a directory or a binary file, not readable text"
+        header = f"{repo}:{path}" + (f"@{ref}" if ref else "")
+        return github_api.scrub(_truncate(f"{header}\n\n{content}"))
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_list_branches(ctx, repo: str, limit: int = 30) -> str:
+    try:
+        branches = await github_api.list_branches(repo, limit=int(limit or 30))
+        if not branches:
+            return "(no branches)"
+        default = await github_api.default_branch(repo)
+        lines = []
+        for b in branches:
+            name = b.get("name") or "?"
+            mark = "  (default)" if name == default else ""
+            protected = " [protected]" if b.get("protected") else ""
+            lines.append(f"{name}{mark}{protected}")
+        return _truncate("\n".join(lines))
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_search_code(ctx, query: str, repo: str = "", limit: int = 20) -> str:
+    try:
+        items = await github_api.search_code(query, repo=repo or "", limit=int(limit or 20))
+        if not items:
+            return "(no code matches)"
+        lines = [
+            f"{(i.get('repository') or {}).get('full_name') or '?'}: {i.get('path') or '?'}"
+            for i in items
+        ]
+        return _truncate("\n".join(lines))
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_read_commit(ctx, repo: str, sha: str) -> str:
+    try:
+        c = await github_api.get_commit(repo, sha)
+        commit = c.get("commit") or {}
+        author = (commit.get("author") or {}).get("name") or _login(c)
+        stats = c.get("stats") or {}
+        files = c.get("files") or []
+        parts = [
+            f"{(c.get('sha') or '')[:10]} {(commit.get('message') or '').splitlines()[0] if commit.get('message') else ''}",
+            f"by {author} · {(commit.get('author') or {}).get('date') or ''} · "
+            f"+{stats.get('additions', 0)}/-{stats.get('deletions', 0)} across {len(files)} file(s)",
+            "",
+            _short(commit.get("message") or "", 1500),
+            "",
+            "--- files ---",
+        ]
+        parts += [f"{f.get('status', '?'):<9} {f.get('filename')}" for f in files]
+        return github_api.scrub(_truncate("\n".join(parts)))
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_merge_pr(ctx, repo: str, number: int, method: str = "merge", title: str = "") -> str:
+    try:
+        result = await github_api.merge_pull(repo, number, method=method or "merge", title=title or "")
+        if not result.get("merged"):
+            return f"[error] GitHub did not merge #{number}: {result.get('message') or 'unknown reason'}"
+        return f"merged #{number} ({method or 'merge'}): {result.get('sha', '')[:10]}"
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_review_pr(ctx, repo: str, number: int, event: str, body: str = "") -> str:
+    try:
+        review = await github_api.create_review(repo, number, event, body or "")
+        return f"submitted a {event.upper()} review on #{number}: {review.get('html_url', '')}"
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_close_issue(ctx, repo: str, number: int, reason: str = "completed") -> str:
+    try:
+        issue = await github_api.set_issue_state(repo, number, state="closed", reason=reason or "completed")
+        return f"closed #{number} ({reason or 'completed'}): {issue.get('html_url', '')}"
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
+async def run_github_write_file(ctx, repo: str, path: str, content: str, message: str,
+                                branch: str = "") -> str:
+    """Commit one file through the API, no clone involved. Creates or updates
+    depending on whether the path already exists on that branch."""
+    try:
+        result = await github_api.put_content(repo, path, content, message, branch=branch or "")
+        commit = (result.get("commit") or {})
+        return (f"committed {path} to {repo}"
+                + (f" on {branch}" if branch else "")
+                + f": {(commit.get('sha') or '')[:10]} {commit.get('html_url', '')}")
+    except github_api.GitHubError as e:
+        return f"[error] {e}"
+
+
 # ---------------------------------------------------------------------------
 # web
 # ---------------------------------------------------------------------------
 
 async def run_web_fetch(ctx, url: str) -> str:
     return await web_tools.web_fetch(url, max_chars=AGENT_OUTPUT_LIMIT, allow_private=ctx.lan)
+
+
+async def run_http_request(ctx, method: str, url: str, headers=None, body: str = "") -> str:
+    # Scrubbed on the way out: an API's error body can echo back the very
+    # token that was sent to it.
+    return github_api.scrub(await web_tools.http_request(
+        method, url, headers=headers, body=body or "",
+        max_chars=AGENT_OUTPUT_LIMIT, allow_private=ctx.lan))
 
 
 async def run_web_search(ctx, query: str, limit: int = 5) -> str:
@@ -656,6 +947,7 @@ def _tool(group, name, description, properties, required=(), handler=None):
 STR = {"type": "string"}
 INT = {"type": "integer"}
 BOOL = {"type": "boolean"}
+OBJ = {"type": "object"}
 
 TOOLS = [
     _tool("shell", "bash",
@@ -665,8 +957,10 @@ TOOLS = [
           ["command"], run_bash),
 
     _tool("files", "read_file",
-          "Read a text file. Relative paths resolve against the primary working directory.",
-          {"path": {**STR, "description": "File path, relative or absolute"}},
+          "Read a text file. Relative paths resolve against the primary working directory. For a file too big to return at once, page through it with offset/limit.",
+          {"path": {**STR, "description": "File path, relative or absolute"},
+           "offset": {**INT, "description": "First line to return, 1-based; omit for the start"},
+           "limit": {**INT, "description": "How many lines to return; omit for the whole file"}},
           ["path"], run_read_file),
     _tool("files", "write_file",
           "Write (create or overwrite) a text file, creating parent directories as needed.",
@@ -688,6 +982,18 @@ TOOLS = [
            "path": {**STR, "description": "Directory to search under; defaults to '.'"},
            "file_glob": {**STR, "description": "Optional filename glob, e.g. '*.py'"}},
           ["pattern"], run_search_files),
+    _tool("files", "find_files",
+          "Find files by NAME using a glob, recursively. Use this to locate a file ('*.env', 'docker-compose*'); use search_files to find text inside files.",
+          {"pattern": {**STR, "description": "Filename glob, e.g. '*.py' or 'Dockerfile*'"},
+           "path": {**STR, "description": "Directory to search under; defaults to '.'"}},
+          ["pattern"], run_find_files),
+
+    _tool("files_write", "move_file",
+          "Move or rename a file or directory. Refuses to overwrite an existing destination.",
+          {"source": STR, "destination": STR}, ["source", "destination"], run_move_file),
+    _tool("files_write", "delete_file",
+          "Delete a single file. Cannot delete directories. This is not reversible -- only do it when the user asked for it.",
+          {"path": STR}, ["path"], run_delete_file),
 
     _tool("git", "git_status",
           "Show the working tree status of the git repository at 'path' (defaults to the primary working directory).",
@@ -712,6 +1018,24 @@ TOOLS = [
           "Push commits to a remote. Give 'branch' to push and set upstream for a new branch.",
           {"path": STR, "remote": {**STR, "description": "Defaults to origin"}, "branch": STR},
           (), run_git_push),
+    _tool("git", "git_fetch",
+          "Update remote-tracking branches without changing the working tree. Safe to run any time; do this before judging whether a clone is out of date.",
+          {"path": STR, "remote": {**STR, "description": "Defaults to origin"}}, (), run_git_fetch),
+    _tool("git", "git_pull",
+          "Fast-forward the current branch from a remote. Refuses to merge or rebase: if the branches have diverged it reports that instead.",
+          {"path": STR, "remote": STR, "branch": STR}, (), run_git_pull),
+    _tool("git", "git_show",
+          "Show one commit: message, author and its diff. Set stat_only=true for just the changed-file list, which is much shorter for a big commit.",
+          {"ref": {**STR, "description": "Commit sha, tag or ref; defaults to HEAD"},
+           "path": STR, "stat_only": BOOL}, (), run_git_show),
+    _tool("git", "git_stash",
+          "Save, restore or list stashed changes. action is one of push, pop, list, drop.",
+          {"action": {**STR, "description": "push, pop, list or drop; defaults to list"},
+           "path": STR, "message": STR}, (), run_git_stash),
+    _tool("git", "git_restore",
+          "Discard uncommitted changes to a named file, or unstage it with staged=true. This throws away work that was never committed, so name the file explicitly.",
+          {"file": {**STR, "description": "File to restore -- required"},
+           "path": STR, "staged": BOOL}, ["file"], run_git_restore),
 
     _tool("github", "github_list_repos",
           "List the authenticated user's repositories, most recently pushed first. Pass 'query' to search GitHub instead.",
@@ -733,6 +1057,26 @@ TOOLS = [
     _tool("github", "github_read_issue",
           "Read one issue with its comments.",
           {"repo": STR, "number": INT}, ["repo", "number"], run_github_read_issue),
+    _tool("github", "github_ci",
+          "Recent GitHub Actions workflow runs for a repository -- this is how to answer 'is the build passing'. Read the 'conclusion' column (success/failure), not 'status'.",
+          {"repo": STR, "branch": {**STR, "description": "Limit to one branch"}, "limit": INT},
+          ["repo"], run_github_ci),
+    _tool("github", "github_read_file",
+          "Read a single file's contents straight from a GitHub repository, without cloning it.",
+          {"repo": STR, "path": {**STR, "description": "Path within the repository"},
+           "ref": {**STR, "description": "Branch, tag or sha; defaults to the default branch"}},
+          ["repo", "path"], run_github_read_file),
+    _tool("github", "github_list_branches",
+          "List a repository's branches, marking the default one and any that are protected.",
+          {"repo": STR, "limit": INT}, ["repo"], run_github_list_branches),
+    _tool("github", "github_search_code",
+          "Search code on GitHub, optionally limited to one repository. Returns matching file paths.",
+          {"query": STR, "repo": {**STR, "description": "Limit to owner/repo"}, "limit": INT},
+          ["query"], run_github_search_code),
+    _tool("github", "github_read_commit",
+          "Read one commit from GitHub: message, author, stats and the list of changed files.",
+          {"repo": STR, "sha": {**STR, "description": "Commit sha, branch or tag"}},
+          ["repo", "sha"], run_github_read_commit),
 
     _tool("github_write", "github_create_issue",
           "Open a new issue on a repository. This is publicly visible -- only do it when the user asked for it.",
@@ -744,13 +1088,42 @@ TOOLS = [
           "Open a pull request from an already-pushed branch. Base defaults to the repository's default branch.",
           {"repo": STR, "title": STR, "head": {**STR, "description": "Branch with the changes"},
            "base": STR, "body": STR}, ["repo", "title", "head"], run_github_create_pr),
+    _tool("github_write", "github_merge_pr",
+          "Merge a pull request. Irreversible and visible to everyone on the repository -- only when the user asked for this specific PR to be merged.",
+          {"repo": STR, "number": INT,
+           "method": {**STR, "description": "merge, squash or rebase; defaults to merge"},
+           "title": STR}, ["repo", "number"], run_github_merge_pr),
+    _tool("github_write", "github_review_pr",
+          "Submit a review on a pull request: APPROVE, REQUEST_CHANGES or COMMENT. Publicly visible, and an approval may be what lets it merge -- only do it when asked.",
+          {"repo": STR, "number": INT,
+           "event": {**STR, "description": "APPROVE, REQUEST_CHANGES or COMMENT"},
+           "body": {**STR, "description": "Review text; required except for APPROVE"}},
+          ["repo", "number", "event"], run_github_review_pr),
+    _tool("github_write", "github_close_issue",
+          "Close an issue, optionally as not_planned. Publicly visible.",
+          {"repo": STR, "number": INT,
+           "reason": {**STR, "description": "completed or not_planned"}},
+          ["repo", "number"], run_github_close_issue),
+    _tool("github_write", "github_write_file",
+          "Create or update one file in a GitHub repository with a commit, without cloning it. Commits directly to the named branch.",
+          {"repo": STR, "path": STR, "content": {**STR, "description": "Full new file content"},
+           "message": {**STR, "description": "Commit message"},
+           "branch": {**STR, "description": "Defaults to the repository's default branch"}},
+          ["repo", "path", "content", "message"], run_github_write_file),
 
     _tool("web", "web_fetch",
-          "Fetch a URL and return its readable text content.",
+          "Fetch a URL and return its readable text content, with markup stripped. For reading pages.",
           {"url": STR}, ["url"], run_web_fetch),
     _tool("web", "web_search",
           "Search the web and return the top results with links and snippets.",
           {"query": STR, "limit": INT}, ["query"], run_web_search),
+    _tool("web", "http_request",
+          "Make one HTTP request with an explicit method, headers and body, returning the raw response. For talking to APIs, where web_fetch's GET-and-strip-markup is the wrong shape.",
+          {"method": {**STR, "description": "GET, POST, PUT, PATCH, DELETE, HEAD or OPTIONS"},
+           "url": STR,
+           "headers": {**OBJ, "description": "Header name -> value, e.g. {\"Authorization\": \"Bearer ...\"}"},
+           "body": {**STR, "description": "Request body, already serialised (e.g. a JSON string)"}},
+          ["method", "url"], run_http_request),
 ]
 
 BY_NAME = {t["name"]: t for t in TOOLS}
@@ -806,11 +1179,22 @@ def agent_system_prompt(ctx: AgentContext) -> str:
         "Use the tools to check things rather than guessing: read files before editing "
         "them, and verify a change landed after making it. Prefer edit_file over "
         "rewriting a whole file.",
+        "find_files locates files by name, search_files finds text inside them. For a "
+        "file too large to return at once, read_file takes offset and limit so you can "
+        "page through it instead of working from a truncated copy.",
     ]
+    if ctx.allows("files_write"):
+        lines.append(
+            "You can also move and delete files. delete_file cannot be undone: do it only "
+            "when the user asked for that specific file to go, and never to 'clean up' "
+            "something you created while working."
+        )
     if ctx.allows("git"):
         lines.append(
             "For repository work use the git_* tools rather than shell git. Commit only "
-            "when asked, with a message describing why the change was made."
+            "when asked, with a message describing why the change was made. git_pull is "
+            "fast-forward only -- if it reports the branches have diverged, say so rather "
+            "than resolving it with shell git."
         )
     if ctx.allows("github"):
         lines.append(
@@ -819,9 +1203,11 @@ def agent_system_prompt(ctx: AgentContext) -> str:
         )
     if ctx.allows("github_write"):
         lines.append(
-            "You can open issues, comment, and open pull requests. Those are public "
-            "actions other people will see: do them only when the user has asked for "
-            "that specific thing, and never as a way of 'reporting' your own progress."
+            "You can open issues, comment, open and merge pull requests, submit reviews, "
+            "close issues, and commit files. Those are public actions other people will "
+            "see: do them only when the user has asked for that specific thing, and never "
+            "as a way of 'reporting' your own progress. Merging and approving are the two "
+            "worst to get wrong -- confirm you have the right PR number first."
         )
     elif ctx.allows("github"):
         lines.append(
