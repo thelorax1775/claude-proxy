@@ -35,6 +35,15 @@ function persist() {
   prefs.set("groups", [...store.groups]);
 }
 
+/** Same as ticking the box in the Agent tab, callable from the composer menu. */
+export function toggleGroup(name, on) {
+  if (on) store.groups.add(name);
+  else store.groups.delete(name);
+  persist();
+  render();
+  emit("mode");
+}
+
 function renderStatus() {
   const s = store.settings;
   $("agent-status").className = "callout";

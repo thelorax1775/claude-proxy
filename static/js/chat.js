@@ -2,7 +2,8 @@
 // SSE rendering for plain streaming, mid-conversation failover, and agent
 // tool rounds.
 
-import { postStream, sseJson } from "./api.js";
+import { api, postStream, sseJson } from "./api.js";
+import { approvalMode } from "./composer.js";
 import { $, escapeHtml, renderRich, shorten, autoGrow } from "./ui.js";
 import { store, on, emit, prefs } from "./store.js";
 import { selectedPaths } from "./workdirs.js";
@@ -82,6 +83,70 @@ function addContinue(rounds) {
   scrollDown();
 }
 
+/** The card a manual-mode run parks on. The run is blocked on the server
+ *  while this is on screen, so it says which tool and shows the exact
+ *  arguments -- approving "bash" without seeing the command would be theatre. */
+function addApproval(id, name, args, group) {
+  clearEmptyState();
+  const risky = ["shell", "files_write", "github_write"].includes(group);
+  const card = document.createElement("div");
+  card.className = `msg approval${risky ? " risky" : ""}`;
+  card.dataset.approvalId = id;
+  card.innerHTML = `
+    <div class="body">
+      <div class="approval-head">
+        <span class="tool-name">${escapeHtml(name)}</span>
+        <span class="tag ${risky ? "bad" : ""}">${escapeHtml(group)}</span>
+      </div>
+      <pre class="code-block"></pre>
+      <div class="button-row approval-actions">
+        <button class="primary-btn" data-decision="approve">Approve</button>
+        <button class="ghost-btn" data-decision="deny">Deny</button>
+        <button class="ghost-btn" data-decision="approve_all">Approve all remaining</button>
+      </div>
+      <p class="hint approval-note"></p>
+    </div>`;
+  card.querySelector("pre").textContent = JSON.stringify(args, null, 2);
+
+  card.querySelectorAll("[data-decision]").forEach((button) => {
+    button.onclick = async () => {
+      card.querySelectorAll("[data-decision]").forEach((b) => { b.disabled = true; });
+      try {
+        await api(`/api/approvals/${encodeURIComponent(id)}`, {
+          method: "POST",
+          body: JSON.stringify({ decision: button.dataset.decision }),
+        });
+      } catch (err) {
+        // Re-enable: the usual cause is a stale card whose run already moved
+        // on, but if it was a transient failure the buttons should still work.
+        card.querySelector(".approval-note").textContent = err.message;
+        card.querySelectorAll("[data-decision]").forEach((b) => { b.disabled = false; });
+      }
+    };
+  });
+
+  messagesEl().appendChild(card);
+  scrollDown(true);
+  return card;
+}
+
+/** Replace the buttons with what was decided, so a scrolled-back transcript
+ *  reads as a record rather than a set of live controls. */
+function finishApproval(card, decision) {
+  if (!card) return;
+  const wording = {
+    approve: "approved",
+    approve_all: "approved — and the rest of this message runs without asking",
+    deny: "denied",
+    timeout: "no answer in time, so it was not run",
+  }[decision] || decision;
+  card.classList.add("is-resolved");
+  card.classList.toggle("denied", decision === "deny" || decision === "timeout");
+  const actions = card.querySelector(".approval-actions");
+  if (actions) actions.remove();
+  card.querySelector(".approval-note").textContent = wording;
+}
+
 function addToolCall(name, args) {
   clearEmptyState();
   const card = document.createElement("details");
@@ -118,9 +183,9 @@ function record(event) {
   store.events.push(event);
 }
 
-function sessionState(backend, model, agent, sandbox, groups, lan) {
+function sessionState(backend, model, agent, sandbox, groups, lan, approval) {
   return {
-    backend, model, agent, sandbox, groups, lan,
+    backend, model, agent, sandbox, groups, lan, approval,
     workdirs: selectedPaths(),
     messages: store.history,
     events: store.events,
@@ -138,6 +203,10 @@ function replayTranscript() {
     else if (event.t === "assistant") addMessage("assistant", event.text, { error: event.error });
     else if (event.t === "notice") addNotice(event.text);
     else if (event.t === "tool") finishToolCall(addToolCall(event.name, event.args || {}), event.output || "");
+    else if (event.t === "approval") {
+      finishApproval(addApproval(event.id || "", event.name, event.args || {}, event.group || ""),
+                     event.decision);
+    }
   }
 
   if (store.events.length === 0) el.innerHTML = EMPTY_STATE;
@@ -262,6 +331,7 @@ async function sendMessage() {
   const agent = agentOn();
   const sandbox = sandboxOn();
   const lan = lanOn();
+  const approval = approvalMode();
   const groups = selectedGroups();
 
   input.value = "";
@@ -269,12 +339,13 @@ async function sendMessage() {
   store.history.push({ role: "user", content: text });
   record({ t: "user", text });
   addMessage("user", text);
-  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups, lan));
+  await ensureSession(text, sessionState(backend, model, agent, sandbox, groups, lan, approval));
 
   // Plain chat streams tokens into one bubble; agent mode emits whole
   // rounds, so its bubbles are created as events arrive.
   let liveBody = agent ? null : addMessage("assistant", "", { streaming: true });
   const toolCards = new Map();
+  const approvalCards = new Map();
   const agentTexts = [];
   let streamed = "";
   let errorText = "";
@@ -303,6 +374,7 @@ async function sendMessage() {
       agent,
       sandbox,
       lan,
+      approval,
       groups,
       max_rounds: maxRounds(),
       workdirs: selectedPaths(),
@@ -356,6 +428,28 @@ async function sendMessage() {
         agentTexts.push(chunk.agent_text);
         addMessage("assistant", chunk.agent_text);
         record({ t: "assistant", text: chunk.agent_text });
+        continue;
+      }
+
+      if (chunk.agent_approval_request) {
+        // The run is blocked server-side until one of these buttons is
+        // pressed, so this card is the whole reason the stream has gone quiet.
+        const { id, name, arguments: args, group } = chunk.agent_approval_request;
+        approvalCards.set(id, {
+          card: addApproval(id, name, args || {}, group || ""),
+          name, args: args || {}, group: group || "",
+        });
+        continue;
+      }
+
+      if (chunk.agent_approval_resolved) {
+        const { id, decision } = chunk.agent_approval_resolved;
+        const entry = approvalCards.get(id);
+        finishApproval(entry && entry.card, decision);
+        if (entry) {
+          record({ t: "approval", id, name: entry.name, args: entry.args,
+                   group: entry.group, decision });
+        }
         continue;
       }
 
@@ -439,7 +533,7 @@ async function sendMessage() {
     inFlight = null;
     setBusy(false);
     input.focus();
-    await saveCurrent(sessionState(backend, model, agent, sandbox, groups, lan));
+    await saveCurrent(sessionState(backend, model, agent, sandbox, groups, lan, approval));
   }
 }
 

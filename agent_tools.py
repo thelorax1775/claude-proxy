@@ -76,6 +76,15 @@ GROUPS = ["shell", "files", "files_write", "git", "github", "github_write", "web
 # to other people's repositories, and delete files.
 DEFAULT_GROUPS = ["shell", "files", "git", "github", "web"]
 
+# How tool calls are gated in agent mode:
+#   manual -- the run pauses before each call and waits for the browser
+#   auto   -- calls run as they come, the Stop button is the only brake
+#   skip   -- same as auto; named separately so the UI can say what it means
+# Only "manual" changes behaviour; the other two are the same code path with
+# different labels, which is worth keeping so "auto" can grow a policy later
+# without the UI having to change again.
+APPROVAL_MODES = ("manual", "auto", "skip")
+
 # Directories find_files never walks into, matching file_search.py -- a hit
 # inside .git or node_modules is noise in both tools.
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
@@ -167,11 +176,13 @@ class AgentContext:
     on, which tool groups are in play, and whether web_fetch may reach the
     local network."""
 
-    def __init__(self, roots: list[str], sandbox: bool, groups: list[str], lan: bool = False):
+    def __init__(self, roots: list[str], sandbox: bool, groups: list[str], lan: bool = False,
+                 approval: str = "skip"):
         self.roots = roots
         self.sandbox = sandbox
         self.groups = groups
         self.lan = lan
+        self.approval = approval if approval in APPROVAL_MODES else "skip"
 
     @property
     def cwd(self) -> str:
@@ -200,7 +211,7 @@ def available_groups() -> dict:
 
 
 def build_agent_context(requested_paths, sandbox_requested: bool, requested_groups=None,
-                        lan_requested: bool = False) -> AgentContext:
+                        lan_requested: bool = False, approval: str = "skip") -> AgentContext:
     """Map what the browser asked for onto directories and groups that are
     actually available. Unknown paths and unusable groups are dropped rather
     than trusted -- a session picks from the registry, it doesn't invent
@@ -228,7 +239,8 @@ def build_agent_context(requested_paths, sandbox_requested: bool, requested_grou
     # so a request asking for the LAN when the operator hasn't allowed it just
     # gets the ordinary refusal.
     return AgentContext(roots, bool(sandbox_requested), groups,
-                        web_tools.lan_allowed(lan_requested))
+                        web_tools.lan_allowed(lan_requested),
+                        approval if approval in APPROVAL_MODES else "skip")
 
 
 def resolve_agent_path(ctx: AgentContext, path: str) -> str:
@@ -1127,6 +1139,13 @@ TOOLS = [
 ]
 
 BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+def group_of(name: str) -> str:
+    """Which group a tool belongs to, for the UI's approval card -- 'bash' and
+    'read_file' deserve different amounts of hesitation."""
+    tool = BY_NAME.get(name)
+    return tool["group"] if tool else "unknown"
 
 
 def tools_for(ctx: AgentContext) -> list[dict]:

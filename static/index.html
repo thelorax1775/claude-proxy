@@ -265,6 +265,50 @@
           <span class="switch-text">LAN access<em id="lan-note">public internet only</em></span>
         </label>
         <div class="spacer"></div>
+
+        <div class="menu-wrap">
+          <button class="ghost-btn small menu-btn" id="plus-btn" title="Add files, change scope, clone a repo">&plus;</button>
+          <div class="menu is-hidden" id="plus-menu">
+            <button type="button" class="menu-item" id="menu-upload">
+              Add files<kbd>Ctrl+U</kbd>
+            </button>
+            <input type="file" id="file-input" multiple hidden>
+            <p class="hint">Uploaded into the first ticked directory, then named in the composer.</p>
+            <p class="hint" id="upload-status"></p>
+
+            <div class="menu-sep"></div>
+            <div class="menu-label">Working directories</div>
+            <div id="menu-dirs" class="menu-list"></div>
+
+            <div class="menu-sep"></div>
+            <div class="menu-label">Tool groups</div>
+            <div id="menu-groups" class="menu-list"></div>
+
+            <div class="menu-sep"></div>
+            <div class="menu-label">Clone a repository</div>
+            <form class="menu-row" id="menu-clone-form">
+              <input id="menu-clone-repo" placeholder="owner/repo" autocomplete="off">
+              <button class="ghost-btn small" type="submit">Clone</button>
+            </form>
+            <p class="hint" id="menu-clone-hint"></p>
+          </div>
+        </div>
+
+        <div class="menu-wrap">
+          <button class="ghost-btn small menu-btn" id="perm-btn"></button>
+          <div class="menu is-hidden" id="perm-menu">
+            <button type="button" class="menu-item" data-mode="manual">
+              Manually approve<em>each tool call waits for you</em>
+            </button>
+            <button type="button" class="menu-item" data-mode="auto">
+              Automatically approve<em>runs as it goes; Stop still works</em>
+            </button>
+            <button type="button" class="menu-item" data-mode="skip">
+              Skip all approvals<em>no prompts at all</em>
+            </button>
+          </div>
+        </div>
+
         <button class="ghost-btn small" id="dirs-shortcut">Scope</button>
       </div>
 

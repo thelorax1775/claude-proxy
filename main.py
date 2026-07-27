@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import agent_tools
+import approvals
 import github_api
 import integrations
 import sessions
@@ -584,6 +585,64 @@ async def add_workdir(request: Request):
         agent_tools.register_workdir(path, (body.get("label") or "").strip()))
 
 
+@app.post("/api/approvals/{call_id}")
+async def resolve_approval(call_id: str, request: Request):
+    """Answer a tool call that a manual-mode run is parked on. Arrives on its
+    own request because the run is mid-stream on another one."""
+    body = await request.json()
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in approvals.DECISIONS:
+        raise HTTPException(status_code=400,
+                            detail=f"decision must be one of: {', '.join(approvals.DECISIONS)}")
+    if not approvals.resolve(call_id, decision):
+        # Usually a double click, or a run that was stopped while the card was
+        # still on screen. Not an error worth a 500.
+        raise HTTPException(status_code=404, detail="that call is no longer waiting for an answer")
+    return {"ok": True, "decision": decision}
+
+
+# Big enough for a log, a config file or a screenshot; small enough that a
+# stray drag-and-drop of a video can't fill the container's disk.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+@app.post("/api/upload")
+async def upload_file(request: Request, name: str, path: str = ""):
+    """Drop a file into one of the registered working directories.
+
+    Takes the raw body rather than multipart/form-data on purpose: multipart
+    would mean adding python-multipart as a dependency for one endpoint, and
+    the browser can send a File object as a body directly."""
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="no file content received")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+
+    # basename() alone handles "../../etc/passwd" and "C:\evil"; the explicit
+    # checks cover what's left ("..", "", and a name that was all separators).
+    safe = os.path.basename((name or "").replace("\\", "/")).strip()
+    if not safe or safe in (".", ".."):
+        raise HTTPException(status_code=400, detail=f"'{name}' is not a usable file name")
+
+    target_dir = agent_tools.norm_path(path) if path else agent_tools.AGENT_WORKSPACE
+    if not any(d["path"] == target_dir for d in agent_tools.WORKDIRS):
+        raise HTTPException(status_code=400,
+                            detail="uploads only go to a registered working directory")
+    if not os.path.isdir(target_dir):
+        raise HTTPException(status_code=400, detail=f"'{target_dir}' does not exist")
+
+    dest = os.path.join(target_dir, safe)
+    try:
+        with open(dest, "wb") as f:
+            f.write(raw)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"could not write the file: {e}")
+    log.info("uploaded %s (%d bytes)", dest, len(raw))
+    return {"path": dest, "name": safe, "bytes": len(raw), "directory": target_dir}
+
+
 @app.delete("/api/workdirs")
 async def delete_workdir(path: str):
     target = agent_tools.norm_path(path)
@@ -844,6 +903,16 @@ def sse_data(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
+# How long a paused tool call waits for someone to answer before it gives up,
+# and how often to push a keepalive while it waits. The keepalive is an SSE
+# comment: browsers and the UI's own parser both ignore it, but it stops an
+# idle-connection timeout somewhere in the middle from killing a run that is
+# simply waiting on a human.
+APPROVAL_TIMEOUT = int(os.getenv("AGENT_APPROVAL_TIMEOUT", "600"))
+APPROVAL_KEEPALIVE = 15
+SSE_KEEPALIVE = ":\n\n"
+
+
 async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentContext, max_rounds: int):
     """Agentic mode for the web UI only: lets the model call bash/file tools
     scoped to the session's working directories on this container, looping
@@ -851,7 +920,7 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     plain text or MAX_AGENT_ITERATIONS is hit. Each round still gets the same
     account-failover treatment as plain chat."""
     yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
-                                      "lan": ctx.lan}})
+                                      "lan": ctx.lan, "approval": ctx.approval}})
     # The system prompt is rebuilt per message rather than kept in history, so
     # toggling the sandbox or changing directories takes effect immediately.
     conv = [{"role": "system", "content": agent_tools.agent_system_prompt(ctx)}]
@@ -865,6 +934,10 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     # anything else in between (a write, a different read) can change what the
     # call would return, so the count starts over.
     repeated, repeats = "", 0
+    # Set by "approve all remaining" and kept for the rest of this message.
+    # Without it, manual mode on a hundred-round review is a hundred prompts,
+    # which is a mode nobody would leave switched on.
+    approved_all = False
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for _ in range(max_rounds):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
@@ -905,13 +978,56 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
                 yield sse_data({"agent_tool_call": {"id": call_id, "name": name, "arguments": args}})
 
+                # Manual mode: stop here and wait for the browser before the
+                # tool runs at all. The decision arrives on a separate request
+                # (POST /api/approvals/{id}) and lands on the future this
+                # registers, since a streaming response can't read from its
+                # own request body mid-flight.
+                refusal = ""
+                if ctx.approval == "manual" and not approved_all:
+                    future = approvals.create(call_id)
+                    yield sse_data({"agent_approval_request": {
+                        "id": call_id, "name": name, "arguments": args,
+                        "group": agent_tools.group_of(name)}})
+                    decision, waited = None, 0
+                    try:
+                        while waited < APPROVAL_TIMEOUT:
+                            try:
+                                # shield: wait_for cancels what it's waiting on
+                                # when it times out, and the future has to
+                                # survive that to still be answerable.
+                                decision = await asyncio.wait_for(
+                                    asyncio.shield(future), timeout=APPROVAL_KEEPALIVE)
+                                break
+                            except asyncio.TimeoutError:
+                                waited += APPROVAL_KEEPALIVE
+                                yield SSE_KEEPALIVE
+                    finally:
+                        # Covers the ordinary path, the timeout, and Stop being
+                        # pressed while this is parked -- GeneratorExit lands on
+                        # the yield above and still runs this.
+                        approvals.cancel(call_id)
+
+                    yield sse_data({"agent_approval_resolved": {
+                        "id": call_id, "decision": decision or "timeout"}})
+                    if decision == approvals.APPROVE_ALL:
+                        approved_all = True
+                    elif decision == approvals.DENY:
+                        refusal = ("[denied] the user declined this call. Do not retry it -- "
+                                   "carry on without it, or say what you needed it for.")
+                    elif decision is None:
+                        refusal = (f"[denied] nobody answered the approval request within "
+                                   f"{APPROVAL_TIMEOUT}s, so the call was not run.")
+
                 # Smaller models get stuck repeating one call forever. Answer
                 # the third identical call in a row with a nudge instead of
                 # running it again, so the round budget goes on actual work.
                 signature = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
                 repeats = repeats + 1 if signature == repeated else 1
                 repeated = signature
-                if repeats > 2:
+                if refusal:
+                    result = refusal
+                elif repeats > 2:
                     result = (f"[error] this is the same call, with the same arguments, "
                               f"{repeats} times in a row with nothing in between. Repeating it "
                               "is not making progress -- do something different, or give your "
@@ -924,7 +1040,7 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 # so its directory list and scope chip stay honest.
                 if name == "github_clone" and not result.startswith("[error]"):
                     yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
-                                                     "lan": ctx.lan},
+                                                     "lan": ctx.lan, "approval": ctx.approval},
                                     "workdirs_changed": True})
 
         # Out of tool rounds. This is a pause, not a failure: ask once more
@@ -968,7 +1084,7 @@ async def ui_chat(request: Request):
     if body.get("agent"):
         ctx = agent_tools.build_agent_context(
             body.get("workdirs"), body.get("sandbox", True), body.get("groups"),
-            body.get("lan", False))
+            body.get("lan", False), body.get("approval", "skip"))
         max_rounds = agent_tools.clamp_rounds(body.get("max_rounds"))
         return StreamingResponse(agent_loop_gen(chain, messages, started_on, ctx, max_rounds),
                                  media_type="text/event-stream")

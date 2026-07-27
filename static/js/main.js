@@ -12,6 +12,7 @@ import { initSessions, loadSessions } from "./sessions.js";
 import { initActivity, loadActivity } from "./activity.js";
 import { initChat, agentOn, sandboxOn } from "./chat.js";
 import { initCli } from "./cli.js";
+import { initComposer, approvalMode } from "./composer.js";
 
 function renderPills() {
   const count = store.backends.length;
@@ -25,6 +26,9 @@ function renderPills() {
     const dirs = store.selectedDirs.size;
     pills.push(`<span class="pill">${dirs} director${dirs === 1 ? "y" : "ies"}</span>`);
     pills.push(`<span class="pill">${selectedGroups().length} tool group(s)</span>`);
+    pills.push(approvalMode() === "manual"
+      ? `<span class="pill on">approvals on</span>`
+      : `<span class="pill warn">no approvals</span>`);
   } else {
     pills.push(`<span class="pill off">agent off</span>`);
   }
@@ -87,6 +91,7 @@ initActivity();
 initSessions();
 initChat();
 initCli();
+initComposer();
 
 on("backends", renderPills);
 on("mode", renderPills);

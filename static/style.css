@@ -412,6 +412,124 @@ button { font: inherit; cursor: pointer; }
   color: var(--text);
 }
 
+/* ---------- composer dropdown menus ---------- */
+
+.menu-wrap { position: relative; }
+
+.menu-btn { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+.menu-btn.warn { color: var(--warn); border-color: var(--warn); }
+.menu-btn .caret { font-size: 0.7rem; opacity: 0.7; }
+
+/* Opens upwards: these buttons sit at the bottom of the window, so a menu
+   dropping down would be off-screen. */
+.menu {
+  position: absolute;
+  bottom: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 30;
+  min-width: 17rem;
+  max-width: min(24rem, 90vw);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 0.4rem;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.menu-item {
+  position: relative;   /* the ✓ on the checked item is absolutely placed */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+  /* Right padding leaves room for the ✓ so a checked label can't run under it. */
+  padding: 0.4rem 1.6rem 0.4rem 0.5rem;
+  border-radius: var(--radius-sm);
+}
+.menu-item:hover { background: var(--surface-2); }
+.menu-item em { font-style: normal; font-size: 0.68rem; color: var(--faint); }
+.menu-item kbd {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
+.menu-item.is-checked { color: var(--accent); }
+.menu-item.is-checked::after { content: " ✓"; position: absolute; right: 0.9rem; }
+
+.menu-sep { height: 1px; background: var(--border); margin: 0.2rem 0; }
+.menu-label {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 0.1rem 0.5rem;
+}
+.menu-list { display: flex; flex-direction: column; gap: 0.05rem; }
+
+.menu-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--text);
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.menu-check:hover { background: var(--surface-2); }
+.menu-check input { width: auto; margin: 0; accent-color: var(--accent); flex-shrink: 0; }
+.menu-check span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-check em { font-style: normal; font-size: 0.68rem; color: var(--faint); }
+.menu-check em.bad { color: var(--danger); }
+.menu-check.is-locked { opacity: 0.5; cursor: not-allowed; }
+
+.menu-row { display: flex; gap: 0.35rem; padding: 0 0.5rem; }
+.menu-row input { flex: 1; }
+.menu .hint { padding: 0 0.5rem; }
+
+.chat.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+
+/* ---------- approval cards ---------- */
+
+.msg.approval {
+  align-self: flex-start;
+  max-width: min(90ch, 100%);
+  width: 100%;
+}
+.msg.approval .body {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-left-width: 3px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.msg.approval.risky .body { border-color: var(--warn); }
+.msg.approval.is-resolved .body { border-color: var(--border); opacity: 0.75; }
+.msg.approval.denied .body { border-color: var(--danger); }
+
+.approval-head { display: flex; align-items: center; gap: 0.5rem; }
+.approval-head .tool-name { font-family: var(--mono); font-weight: 600; color: var(--accent); }
+.approval-actions { flex-wrap: wrap; }
+.approval-actions .primary-btn, .approval-actions .ghost-btn { flex: 0 0 auto; }
+
 .hint { font-size: 0.72rem; color: var(--muted); margin: 0; }
 .hint.error { color: var(--danger); }
 .hint:empty { display: none; }

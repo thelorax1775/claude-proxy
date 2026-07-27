@@ -260,6 +260,53 @@ All sit above the composer and are remembered per browser:
 The chip next to the model dropdown always shows the live state, e.g.
 `agent · sandboxed · myproject +1 · LAN`.
 
+### Approving tool calls
+
+The dropdown to the right of the switches decides whether you see a tool call
+before it happens:
+
+| mode | what happens |
+| --- | --- |
+| **Manually approve** | The run stops before each call and shows the tool and its exact arguments. Nothing executes until you answer. |
+| **Automatically approve** | Calls run as they come. **Stop** is the only brake. |
+| **Skip all approvals** | The same, stated plainly. This is the default and how every earlier version behaved. |
+
+An approval card offers **Approve**, **Deny** and **Approve all remaining**.
+That last one matters: a code review can be a hundred tool rounds, and
+approving each `read_file` individually is a mode nobody would leave switched
+on. It applies to the rest of that one message only -- the next message asks
+again.
+
+Denying doesn't derail the run. The model is told the call was declined and
+asked to carry on without it or explain what it needed, so it can adapt
+rather than retry in a loop. Nobody answering within
+`AGENT_APPROVAL_TIMEOUT` (default 600s) counts as a denial.
+
+The run is genuinely blocked server-side while a card is on screen: the loop
+is parked on a future, and the decision arrives on a separate request
+(`POST /api/approvals/{id}`), because a response that is mid-stream can't read
+from its own request. While it waits, the stream emits SSE comment keepalives
+so an idle-connection timeout somewhere in the middle can't kill a run that is
+simply waiting on a person.
+
+> Manual mode is per browser and remembered. It is **not** a security
+> boundary: the proxy has no auth, so anyone who can reach the port can also
+> just switch it to Skip. It stops the model surprising *you*, not somebody
+> else deciding to.
+
+### The + menu
+
+Next to the permission dropdown, for the things you'd otherwise open the side
+panel for mid-conversation:
+
+- **Add files** (`Ctrl+U`, or drag anything onto the chat) uploads into the
+  first ticked working directory and writes the paths into the composer, so
+  you can say what to do with them. 25 MB per file.
+- **Working directories** and **Tool groups** are the same tick-boxes as the
+  Agent tab, sharing the same state -- changing one updates the other.
+- **Clone a repository** takes `owner/repo` and registers the clone as a
+  working directory without a trip to the GitHub tab.
+
 ### Working directories
 
 The Agent tab lists every directory agent mode may work in. `workspace/`
@@ -535,6 +582,8 @@ You should see Anthropic-style SSE events (`message_start`,
 | `POST /v1/messages/count_tokens` | Rough `len/4` estimate for context bookkeeping |
 | `GET /health` | Liveness plus the configured backend names |
 | `GET /status` | Last 50 backend attempts, newest last |
+| `POST /api/approvals/{id}` | Answer a tool call a manual-mode run is parked on |
+| `POST /api/upload?name=&path=` | Raw-body file upload into a registered working directory |
 | `GET /` | The web UI |
 
 ### Known limitations

@@ -15,6 +15,16 @@ function persistSelection() {
   prefs.set("selectedDirs", [...store.selectedDirs]);
 }
 
+/** Tick/untick from anywhere (the panel, or the composer's + menu) and keep
+ *  both views showing the same thing. */
+export function toggleDir(path, on) {
+  if (on) store.selectedDirs.add(path);
+  else store.selectedDirs.delete(path);
+  persistSelection();
+  render();
+  emit("workdirs");
+}
+
 function render() {
   const list = $("workdir-list");
   if (store.workdirs.length === 0) {
