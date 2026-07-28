@@ -23,6 +23,7 @@ import shutil
 import sys
 
 import background
+import documents
 import git_tools
 import github_api
 import integrations
@@ -198,6 +199,12 @@ class AgentContext:
         # Working state for this run only. It dies with the context, which is
         # the point -- a checklist that outlives its reason is worse than none.
         self.tasks = tasklist.TaskList()
+        # Which model is answering, so an image tool call can tell whether it
+        # would be seen. Set by the caller once the backend is chosen.
+        self.model = ""
+        # Images read this round, waiting to be attached as a user message --
+        # a tool result is text and cannot carry one.
+        self.pending_images: list[dict] = []
 
     @property
     def cwd(self) -> str:
@@ -359,11 +366,79 @@ async def run_kill_shell(ctx, shell_id: str) -> str:
     return await background.kill(shell)
 
 
+async def run_notebook_edit(ctx, path: str, mode: str = "replace", cell: int = None,
+                            source: str = "", cell_type: str = "code") -> str:
+    """Change one cell of a notebook, leaving the rest of the file alone.
+
+    A cell at a time rather than write_file, because a notebook is a JSON
+    document carrying every other cell's outputs, execution counts and
+    metadata -- rewriting the whole thing to change one cell throws all of that
+    away, and the loss isn't visible until somebody opens it.
+    """
+    try:
+        target = resolve_agent_path(ctx, path)
+    except ValueError as e:
+        return f"[error] {e}"
+    if documents.kind_of(target) != "notebook":
+        return f"[error] '{path}' is not a .ipynb notebook"
+    if not os.path.isfile(target):
+        return f"[error] '{path}' does not exist"
+    if cell_type not in ("code", "markdown"):
+        return "[error] cell_type must be 'code' or 'markdown'"
+
+    nb, error = documents.load_notebook(target)
+    if error:
+        return error
+    problem = documents.edit_notebook(nb, mode=mode, index=cell,
+                                      source=source, cell_type=cell_type)
+    if problem:
+        return problem
+    problem = documents.save_notebook(target, nb)
+    if problem:
+        return problem
+    where = "at the end" if cell is None else f"at cell {cell}"
+    total = len(nb["cells"])
+    return f"{mode}d a cell {where} in {os.path.basename(target)} ({total} cells now)."
+
+
 async def run_write_todos(ctx, tasks) -> str:
     problem = ctx.tasks.replace(tasks)
     if problem:
         return problem
     return ctx.tasks.render()
+
+
+def _read_document(ctx, target: str, kind: str) -> str:
+    """read_file's answer for a notebook, a PDF or an image."""
+    if kind == "notebook":
+        nb, error = documents.load_notebook(target)
+        if error:
+            return error
+        return github_api.scrub(_truncate(documents.render_notebook(nb)))
+
+    if kind == "pdf":
+        return github_api.scrub(_truncate(documents.pdf_text(target)))
+
+    # An image. Whether the model can be shown one depends entirely on which
+    # model is answering, and getting that wrong is expensive: an image sent to
+    # a model that can't take one fails the whole request at the provider with
+    # a 400, not just this tool call. So it is checked, not attempted.
+    described = documents.describe_image(target)
+    if not documents.model_sees_images(ctx.model):
+        return (f"[image] {os.path.basename(target)} -- {described}.\n"
+                f"The current model ({ctx.model or 'unknown'}) can't be shown images, so "
+                "you cannot see this one. Say that rather than guessing at its contents; "
+                "the user can switch to a vision-capable model and ask again.")
+    data_url = documents.image_data_url(target)
+    if data_url is None:
+        return (f"[image] {os.path.basename(target)} -- {described}. Too large to send "
+                f"(limit {documents.MAX_IMAGE_BYTES} bytes), so you cannot see it.")
+    # Tool results are text, so the image itself can't go here. It's queued and
+    # the agent loop attaches it as a user message once this round's results
+    # are in -- see main.py.
+    ctx.pending_images.append({"path": target, "data_url": data_url})
+    return (f"[image] {os.path.basename(target)} -- {described}. "
+            "The image itself follows this round's tool results.")
 
 
 async def run_read_file(ctx, path: str, offset: int = 0, limit: int = 0) -> str:
@@ -372,6 +447,12 @@ async def run_read_file(ctx, path: str, offset: int = 0, limit: int = 0) -> str:
     simply unreachable, and the model has no way to ask for the rest."""
     try:
         target = resolve_agent_path(ctx, path)
+        # Notebooks, PDFs and images are all files that read as garbage when
+        # opened as UTF-8 text -- and the model reads the garbage and concludes
+        # the file is corrupt rather than that it asked the wrong way.
+        special = documents.kind_of(target)
+        if special and os.path.isfile(target):
+            return _read_document(ctx, target, special)
         try:
             start = max(1, int(offset or 1))
         except (TypeError, ValueError):
@@ -1181,6 +1262,17 @@ TOOLS = [
           "Stop a background shell and everything it started. Use it when a job is no longer needed -- a dev server you started will otherwise keep running.",
           {"shell_id": {**STR, "description": "The id from bash(run_in_background=true)"}},
           ["shell_id"], run_kill_shell),
+
+    _tool("files_write", "notebook_edit",
+          "Change one cell of a Jupyter notebook, leaving every other cell's source, outputs and metadata intact. Use this rather than write_file for .ipynb files -- rewriting the whole file throws all of that away.",
+          {"path": {**STR, "description": "The .ipynb file"},
+           "mode": {**STR, "enum": ["insert", "replace", "delete"],
+                    "description": "Default replace"},
+           "cell": {**INT, "description": "0-based cell index. For insert, the position to insert at; omit to append."},
+           "source": {**STR, "description": "New cell contents, for insert and replace"},
+           "cell_type": {**STR, "enum": ["code", "markdown"],
+                         "description": "For insert; default code"}},
+          ["path"], run_notebook_edit),
 
     _tool("files", "read_file",
           "Read a text file. Relative paths resolve against the primary working directory. For a file too big to return at once, page through it with offset/limit.",

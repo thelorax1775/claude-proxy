@@ -1599,6 +1599,10 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     account-failover treatment as plain chat."""
     yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
                                       "lan": ctx.lan, "approval": ctx.approval}})
+    # So a tool asked to read an image can tell whether this model could
+    # actually be shown one. The chain's first model is the one that will
+    # answer unless it fails over, which is the right thing to plan around.
+    ctx.model = chain[0][1] if chain else ""
     # The system prompt is rebuilt per message rather than kept in history, so
     # toggling the sandbox or changing directories takes effect immediately.
     conv = [{"role": "system", "content": agent_tools.agent_system_prompt(ctx)}]
@@ -1763,6 +1767,21 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                     yield sse_data({"agent_context": {"roots": ctx.roots, "sandbox": ctx.sandbox, "cwd": ctx.cwd,
                                                      "lan": ctx.lan, "approval": ctx.approval},
                                     "workdirs_changed": True})
+
+            # An image read this round, delivered now. It can't ride in the
+            # tool result -- those are text -- so it goes in a user message
+            # straight after them, which is the only place the chat-completions
+            # format takes image content.
+            if ctx.pending_images:
+                blocks = [{"type": "text",
+                           "text": "Here " + ("is the image" if len(ctx.pending_images) == 1
+                                              else "are the images") + " you just read:"}]
+                for image in ctx.pending_images:
+                    blocks.append({"type": "text", "text": image["path"]})
+                    blocks.append({"type": "image_url",
+                                   "image_url": {"url": image["data_url"]}})
+                conv.append({"role": "user", "content": blocks})
+                ctx.pending_images = []
 
             for tc in dropped:
                 # Over the per-round cap, but still answered: every tool_call in
