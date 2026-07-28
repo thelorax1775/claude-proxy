@@ -377,10 +377,9 @@ directory.
 Added directories are stored in `workdirs.json` (gitignored) and survive a
 restart. Ticking is per browser, not shared.
 
-> Under the systemd unit, `ProtectSystem=strict` means only the paths in
-> `ReadWritePaths=` are writable. If you add a working directory outside
-> `/opt/claude-proxy` and the agent can't write to it, add it there too and
-> `daemon-reload` — and set `ProtectHome=false` if it lives under `/home`.
+> A directory added here is writable straight away. The unit no longer sets
+> `ProtectSystem`/`ReadWritePaths`, so there is no second list to keep in sync
+> and no `daemon-reload` after adding one.
 
 ### Tool groups
 
@@ -399,8 +398,11 @@ shell without also handing it the ability to open pull requests:
 | SSH | 4 | `ssh_list_hosts`, `ssh_run`, `ssh_upload`, `ssh_download` |
 
 Unticked groups aren't offered to the model at all, and are refused
-server-side if it invents a call anyway. The GitHub groups only become
-available once a token is connected, and SSH once a host is registered.
+server-side if it invents a call anyway. The GitHub groups are the only ones
+that can be unavailable rather than merely unticked -- every one of their
+tools is a call against an authenticated API, so without a token there is
+nothing to offer. SSH is an ordinary toggle: tick it whenever you like, and
+with no hosts registered the tools just have nowhere to go and say so.
 Unticking *every* group is allowed and means what it says: no tools, so the
 message is an ordinary chat.
 
@@ -482,14 +484,24 @@ Worth knowing:
   A command that times out is disconnected, but **may keep running on the
   remote host**: ssh has no way to kill it from this end.
 - `ssh_download` refuses to overwrite an existing local file.
-- The group stays unavailable, and says why, until there is both a registered
-  host and an `ssh` binary on the proxy's machine.
+- Keys come from the service user's `~/.ssh` in the ordinary way, unless a
+  host card names its own **Key file**. `known_hosts` defaults to
+  `~/.ssh/known_hosts` and the directory is created if it doesn't exist --
+  a service account often has no home on disk, and ssh will not record a host
+  key it cannot write.
 
-> Under the systemd unit, `ProtectHome=true` hides the service user's home,
-> so `~/.ssh` is unreachable and every connection fails on the key *and* on
-> writing `known_hosts`. Keep both inside `/opt/claude-proxy/.ssh` and set
-> `AGENT_SSH_KNOWN_HOSTS` -- `deploy/claude-proxy.service` spells out the
-> exact commands.
+> Nothing in the unit stands between the tools and `~/.ssh` any more — the
+> filesystem protections that used to hide it are gone, and the process has
+> the reach of the `claude-proxy` user. Generate a key for that account,
+> install the `.pub` on the machines you want to reach, and the group works:
+>
+> ```sh
+> sudo -u claude-proxy ssh-keygen -t ed25519 -N ''
+> ```
+>
+> The account and the machine are the boundary now, so run this somewhere
+> you're comfortable with that — a container or a VM, not a workstation with
+> your own files on it.
 
 ### Tool rounds
 

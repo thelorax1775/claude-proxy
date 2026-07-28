@@ -192,27 +192,76 @@ def test_bash_timeouts_are_clamped():
 
 
 # ---------------------------------------------------------------------------
-# Group availability -- the group must not be offered when it can't work
+# Group availability -- an ordinary toggle, gated on nothing
 # ---------------------------------------------------------------------------
 
-def test_the_group_is_unavailable_with_no_hosts(hosts, monkeypatch):
+def test_the_group_is_available_with_no_hosts(hosts, monkeypatch):
+    """An empty registry makes the tools useless, not unavailable. Disabling
+    the checkbox until a host existed meant the Agent tab greyed out the
+    control you were there to use."""
     monkeypatch.setattr(hosts, "ssh_available", lambda: True)
-    assert agent_tools.available_groups()["ssh"] is False
-    assert "host" in agent_tools.group_unavailable_reason("ssh")
+    assert agent_tools.available_groups()["ssh"] is True
+    assert agent_tools.group_unavailable_reason("ssh") == ""
 
 
-def test_the_group_is_unavailable_without_an_ssh_binary(hosts, monkeypatch):
+def test_the_group_is_available_without_an_ssh_binary(hosts, monkeypatch):
+    """A missing ssh client is reported by the tool that tries to use it, the
+    same way a missing git is -- it doesn't take the group away."""
     hosts.register_host("nas", "e.com")
     monkeypatch.setattr(hosts, "ssh_available", lambda: False)
-    assert agent_tools.available_groups()["ssh"] is False
-    assert "not installed" in agent_tools.group_unavailable_reason("ssh")
+    assert agent_tools.available_groups()["ssh"] is True
+    assert agent_tools.group_unavailable_reason("ssh") == ""
 
 
-def test_the_group_becomes_available_with_a_host_and_a_binary(hosts, monkeypatch):
+def test_the_group_stays_available_with_a_host(hosts, monkeypatch):
     hosts.register_host("nas", "e.com")
     monkeypatch.setattr(hosts, "ssh_available", lambda: True)
     assert agent_tools.available_groups()["ssh"] is True
     assert agent_tools.group_unavailable_reason("ssh") == ""
+
+
+def test_the_group_can_be_selected_with_an_empty_registry(hosts):
+    """build_agent_context drops unusable groups, so 'available' has to hold
+    for the tick to survive the round trip to the server."""
+    ctx = agent_tools.build_agent_context(None, True, ["ssh"])
+    assert ctx.allows("ssh")
+
+
+def test_the_prompt_says_what_to_do_when_no_host_is_registered(hosts):
+    ctx = agent_tools.build_agent_context(None, True, ["ssh"])
+    prompt = agent_tools.agent_system_prompt(ctx)
+    assert "none yet" in prompt and "Agent tab" in prompt
+
+
+# ---------------------------------------------------------------------------
+# known_hosts -- ssh will not record a key it cannot write
+# ---------------------------------------------------------------------------
+
+def test_known_hosts_defaults_under_the_users_ssh_dir(hosts):
+    assert hosts.KNOWN_HOSTS.endswith(os.path.join(".ssh", "known_hosts"))
+
+
+def test_the_options_always_name_the_known_hosts_file(hosts):
+    joined = " ".join(hosts.base_opts({"key_path": ""}))
+    assert f"UserKnownHostsFile={hosts.KNOWN_HOSTS}" in joined
+
+
+def test_ensure_ssh_dir_creates_it_private(hosts, monkeypatch, tmp_path):
+    target = tmp_path / "nonexistent" / "known_hosts"
+    monkeypatch.setattr(hosts, "KNOWN_HOSTS", str(target))
+    hosts.ensure_ssh_dir()
+    assert target.parent.is_dir()
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_ssh_dir_survives_a_read_only_home(hosts, monkeypatch, tmp_path):
+    """A home it cannot write is the connection's problem to report, not a
+    reason to raise out of a tool call."""
+    def boom(*a, **k):
+        raise PermissionError("read-only file system")
+    monkeypatch.setattr(hosts, "KNOWN_HOSTS", str(tmp_path / "nope" / "known_hosts"))
+    monkeypatch.setattr(hosts.os, "makedirs", boom)
+    hosts.ensure_ssh_dir()  # must not raise
 
 
 def test_ssh_is_not_a_default_group():
@@ -317,10 +366,10 @@ async def test_testing_an_unknown_host_is_404(client):
     assert (await client.post("/api/ssh-hosts/nope/test")).status_code == 404
 
 
-async def test_settings_reports_the_ssh_group_and_why(client):
+async def test_settings_reports_the_ssh_group_as_available(client):
     settings = (await client.get("/api/settings")).json()
     group = next(g for g in settings["groups"] if g["name"] == "ssh")
-    assert group["available"] is False
-    assert group["reason"]
+    assert group["available"] is True
+    assert not group["reason"]
     assert set(group["tools"]) == {"ssh_list_hosts", "ssh_run", "ssh_upload", "ssh_download"}
     assert settings["ssh_timeout"] and settings["ssh_max_timeout"]

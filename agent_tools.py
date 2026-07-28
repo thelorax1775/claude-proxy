@@ -206,9 +206,15 @@ class AgentContext:
 
 
 def available_groups() -> dict:
-    """Which groups are usable right now. GitHub needs a token; web search
-    needs a provider key, though web_fetch works without one; ssh needs both a
-    registered host and an ssh client to drive."""
+    """Which groups are usable right now. GitHub needs a token because every
+    one of its tools is a call against an authenticated API; web search needs a
+    provider key, though web_fetch works without one.
+
+    Nothing else is gated. ssh in particular is an ordinary toggle: an empty
+    host registry makes it useless, not unavailable, and ssh_list_hosts says so
+    in a sentence. Withholding the checkbox until the registry was populated
+    only meant the Agent tab disabled the very control you were looking for
+    while you set it up."""
     has_github = bool(integrations.get("github_token"))
     return {
         "shell": True,
@@ -218,7 +224,7 @@ def available_groups() -> dict:
         "github": has_github,
         "github_write": has_github,
         "web": True,
-        "ssh": bool(ssh_tools.HOSTS) and ssh_tools.ssh_available(),
+        "ssh": True,
     }
 
 
@@ -229,10 +235,6 @@ def group_unavailable_reason(group: str) -> str:
         return ""
     if group in ("github", "github_write"):
         return "needs a GitHub token"
-    if group == "ssh":
-        if not ssh_tools.ssh_available():
-            return "the ssh command is not installed on the proxy"
-        return "needs a registered SSH host"
     return ""
 
 
@@ -1393,7 +1395,13 @@ def agent_system_prompt(ctx: AgentContext) -> str:
             )
 
     if ctx.allows("ssh"):
-        names = ", ".join(h["name"] for h in ssh_tools.HOSTS) or "none"
+        names = ", ".join(h["name"] for h in ssh_tools.HOSTS)
+        if not names:
+            # The group can be switched on before any host exists, so say what
+            # to do about it rather than letting the model discover an empty
+            # list mid-task and guess at a connection string.
+            names = ("none yet -- tell the user to add one in the Agent tab; "
+                     "do not try to reach a machine another way")
         lines.append(
             f"You can also reach other machines over SSH. Registered hosts: {names}. "
             "Refer to a host by that name -- there is no way to connect to anything "

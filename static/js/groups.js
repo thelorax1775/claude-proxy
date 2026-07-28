@@ -16,12 +16,11 @@ const LABELS = {
   ssh: ["SSH", "run commands and copy files on registered remote hosts"],
 };
 
-// Fallback only: the server now sends a `reason` per group, which is more
-// specific than this can be (ssh is unavailable for two different reasons).
+// Fallback only: the server sends a `reason` per group, which is the thing
+// actually shown. Only the GitHub groups can be unavailable at all.
 const NEEDS = {
   github: "needs a GitHub token",
   github_write: "needs a GitHub token",
-  ssh: "needs a registered SSH host",
 };
 
 /** Groups this session wants, minus anything the server can't offer. */

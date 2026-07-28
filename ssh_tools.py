@@ -41,12 +41,32 @@ SSH_MAX_TIMEOUT = int(os.getenv("AGENT_SSH_MAX_TIMEOUT", "600"))
 # the stricter setting.
 STRICT_HOST_KEY = os.getenv("AGENT_SSH_STRICT_HOST_KEY", "accept-new")
 
-# Where ssh keeps the host keys it has accepted. Empty means ssh's own default
-# (~/.ssh/known_hosts), which is right almost everywhere -- but under a
-# hardened systemd unit ProtectHome=true hides the service user's home, and
-# ssh then cannot record a host key at all. Pointing this at a writable path
-# inside the unit's own tree is the fix.
-KNOWN_HOSTS = os.getenv("AGENT_SSH_KNOWN_HOSTS", "").strip()
+# Where ssh keeps the host keys it has accepted. Defaults to the ordinary
+# ~/.ssh/known_hosts; override only to put it somewhere else.
+#
+# It is spelled out rather than left to ssh because ssh will not record a key
+# it cannot write, and a service account frequently has no home directory on
+# disk at all -- the account is created for the unit, nobody ever logs in as
+# it, so nothing ever makes the directory. Naming the path lets ensure_ssh_dir
+# create it once, up front, instead of every first connection failing the
+# host-key check with a permissions error that reads like a network problem.
+KNOWN_HOSTS = (os.getenv("AGENT_SSH_KNOWN_HOSTS", "").strip()
+               or os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts"))
+
+
+def ensure_ssh_dir() -> None:
+    """Make sure the directory holding known_hosts exists, 0700. Best effort:
+    a read-only home is a reason for the connection to fail with ssh's own
+    message, not a reason for the proxy to refuse to start."""
+    parent = os.path.dirname(KNOWN_HOSTS)
+    if not parent or os.path.isdir(parent):
+        return
+    try:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create %s (%s) -- ssh may fail the host-key check "
+                    "until it exists and is writable", parent, e)
+
 
 # Deliberately narrow. These values become argv elements for ssh, where a
 # leading "-" is an option rather than a hostname, and where whitespace or an
@@ -305,6 +325,7 @@ async def run_command(h: dict, command: str, timeout: int) -> str:
     """Run one command on a host and return its combined output."""
     if not command or not command.strip():
         return "[error] a command is required"
+    ensure_ssh_dir()
     args = [*base_opts(h), "-p", str(h["port"]), "--", target(h), command]
     try:
         rc, out = await _run("ssh", args, timeout)
@@ -324,6 +345,7 @@ async def run_command(h: dict, command: str, timeout: int) -> str:
 
 async def copy_file(h: dict, local: str, remote: str, *, upload: bool, timeout: int) -> str:
     """scp one file to or from a host. Note scp spells the port -P, not -p."""
+    ensure_ssh_dir()
     remote_spec = f"{target(h)}:{shlex.quote(remote)}"
     src, dst = (local, remote_spec) if upload else (remote_spec, local)
     args = [*base_opts(h), "-P", str(h["port"]), "--", src, dst]

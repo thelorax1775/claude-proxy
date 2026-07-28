@@ -13,33 +13,25 @@ ExecStart=/opt/claude-proxy/.venv/bin/uvicorn main:app --host ${PROXY_HOST} --po
 Restart=always
 RestartSec=3
 
-# Basic hardening -- this process holds API keys, has no auth in front of it,
-# and can run shell commands for the model in agent mode, so keep its blast
-# radius small.
+# The filesystem protections that used to be here (ProtectSystem=strict,
+# ProtectHome=true, ReadWritePaths=) are deliberately gone. They made every
+# tool group that touches something outside /opt/claude-proxy a special case:
+# a working directory added in the web UI needed a matching ReadWritePaths
+# entry and a daemon-reload before the agent could write to it, and the SSH
+# group needed its own key location and an AGENT_SSH_KNOWN_HOSTS override
+# because ~/.ssh was hidden. Every group is now an ordinary toggle, and the
+# process has the reach of the claude-proxy user -- no more, but no less.
 #
-# Note these two lines also bound what agent mode can reach: ProtectHome
-# hides /home entirely, and ProtectSystem=strict makes everything outside
-# ReadWritePaths read-only. If you add a working directory in the web UI and
-# the agent can't write to it, list it here too (space-separated) and set
-# ProtectHome=false if it lives under /home -- then daemon-reload + restart.
+# What that means: agent mode can read and write anything that user can, and
+# the SSH tools reach whatever its keys open. The account, and the machine
+# this runs on, are the boundary. Run it somewhere you're happy with that --
+# a container or a VM, not a workstation with your own files on it.
 #
-# ProtectHome=true also hides the service user's own home, so ~/.ssh is
-# unreachable and every SSH tool fails with "Permission denied (publickey)".
-# Rather than switching it off, keep both the key and known_hosts inside the
-# unit's own tree --
-#   install -d -m 700 -o claude-proxy -g claude-proxy /opt/claude-proxy/.ssh
-#   ssh-keygen -t ed25519 -f /opt/claude-proxy/.ssh/id_ed25519 -N ''
-#   chown claude-proxy:claude-proxy /opt/claude-proxy/.ssh/id_ed25519*
-# -- give that absolute path as the host's "Key file" in the Agent tab, and
-# set this in .env so ssh has somewhere it may record host keys:
-#   AGENT_SSH_KNOWN_HOSTS=/opt/claude-proxy/.ssh/known_hosts
-# Without that last line ssh cannot write known_hosts and every connection
-# fails on the host-key check.
+# NoNewPrivileges and PrivateTmp stay: neither restricts what the tools can
+# do, they only stop a setuid binary escalating out of the service and keep
+# /tmp from being shared with the rest of the system.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/claude-proxy
 
 [Install]
 WantedBy=multi-user.target
