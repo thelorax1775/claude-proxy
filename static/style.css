@@ -193,6 +193,11 @@ body {
 /* Two words that must not become four lines when the head gets crowded. */
 .section-head .ghost-btn { white-space: nowrap; flex: none; }
 
+/* Its own row: the sidebar is too narrow to hold a heading, a button and a
+   sentence explaining the ordering rule on one line without shredding all
+   three of them. */
+.order-hint { margin: 0.25rem 0 0.5rem; }
+
 .stack { display: flex; flex-direction: column; gap: 0.5rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 
