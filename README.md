@@ -11,9 +11,41 @@ harness). The *model* answering prompts is whichever backend in
 models for free; you're using Claude Code as a CLI frontend for other
 models.
 
-There's also a web UI bundled in, which is a full chat client in its own
-right with an agent mode that can work on real files, git repositories and
-GitHub. That part is separate from Claude Code and doesn't require it.
+**And a web UI, which is half the point.** Bundled in is a full chat client
+with an agent mode: 52 tools across 10 groups that run commands, edit files,
+drive git and GitHub, search the web, and reach other machines over SSH --
+with per-message control over what's allowed and an approval prompt before
+each call if you want one. It's separate from Claude Code and works without
+it.
+
+> ### ⚠ There is no authentication
+>
+> None. No login, no shared key. **Anything that can reach the port can spend
+> your API keys, switch on agent mode, and get a shell on the machine running
+> the proxy** -- and, if you've registered SSH hosts, on those too.
+>
+> `PROXY_HOST` is the only thing standing in front of that. Keep it on
+> `127.0.0.1`, or on a private interface (a Tailscale IP, say) only you can
+> reach. **Never bind it to a public interface.** See
+> [No auth, by design](#no-auth-by-design).
+
+---
+
+## Contents
+
+- [Quickstart](#quickstart) — install, add a backend, point Claude Code at it
+- [Configure backends](#configure-backends) — the failover chain, where to get
+  free keys, [remaining allowance](#remaining-allowance)
+- [Point Claude Code at it](#point-claude-code-at-it) — `settings.json`, which
+  model answers
+- [Web UI](#web-ui) — the tabs, [long conversations](#when-a-conversation-gets-too-long),
+  [no auth](#no-auth-by-design)
+- [Agent mode](#agent-mode) — the switches, approvals, working directories
+- [Tool groups](#tool-groups) — what the model can do, and turning it off
+- [SSH hosts](#ssh-hosts) — reaching other machines
+- [GitHub and web integrations](#github-and-web-integrations)
+- [Deployment](#deployment) — systemd, updating
+- [Reference](#reference) — files, tests, endpoints, limitations
 
 ---
 
@@ -59,87 +91,6 @@ Two optional command-line tools, only for agent mode: `git` for the git and
 GitHub tool groups, and an OpenSSH client (`ssh`/`scp`) for the SSH group.
 If one is missing the group still ticks; the tool that needs it says so when
 it runs.
-
----
-
-## Point Claude Code at it
-
-Claude Code decides where to send requests from two environment variables.
-You can set them once in a config file, or per terminal.
-
-### Recommended: set it once
-
-Save this as `~/.claude/settings.json` and every `claude` session on the
-machine uses the proxy -- every project, every terminal, no exports:
-
-```json
-{
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
-    "ANTHROPIC_API_KEY": "local-claude-proxy"
-  }
-}
-```
-
-- On Windows that path is `%USERPROFILE%\.claude\settings.json`.
-- For one project only, use `.claude/settings.json` inside that project.
-- **If the file already exists, merge the `env` block in** rather than
-  replacing the file.
-- Claude Code reads it at launch.
-
-The **CLI tab in the web UI generates this for you** with the right address
-already substituted, plus a copy button -- which is worth using, because the
-correct `ANTHROPIC_BASE_URL` is whatever address *the machine running
-`claude`* can reach the proxy on, and that isn't always `127.0.0.1`.
-
-`ANTHROPIC_API_KEY` is an unchecked placeholder. The proxy has no auth and
-never looks at it; Claude Code just refuses to start without something set.
-Your real provider keys live in `backends.json` on the proxy's machine.
-
-### Alternative: per terminal
-
-Applies only to the shell you run it in, and has to be repeated in every new
-one. Fine for a quick test.
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
-export ANTHROPIC_API_KEY=local-claude-proxy
-claude
-```
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8082"
-$env:ANTHROPIC_API_KEY = "local-claude-proxy"
-claude
-```
-
-### If `claude` runs on a different machine
-
-Set `PROXY_HOST` in `.env` to an interface the proxy is actually reachable
-on (a Tailscale or LAN IP), restart, and use that address as
-`ANTHROPIC_BASE_URL`. There is no auth in front of this proxy, so never bind
-it to a public interface -- see [No auth, by design](#no-auth-by-design).
-
-### Which model actually answers
-
-Claude Code sends whatever model string is active (its default, or whatever
-you set `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` to). Per backend,
-the proxy buckets on the string:
-
-- contains `haiku` → that backend's `small_model`
-- everything else (sonnet, opus, default) → that backend's `big_model`
-
-Change the mapping in `backends.json`, or from the pencil button on the
-backend's card in the **Backends** tab. A backend missing one of the two
-fields falls back to the other rather than failing.
-
-**Every model you list must support function/tool calling.** Claude Code's
-file editing and bash execution run through Anthropic tool-use blocks,
-translated here into OpenAI `tools`/`tool_calls`. A model without tool
-support won't error loudly -- Claude Code will just seem to "forget" how to
-edit files whenever failover lands on it. Check the provider's docs before
-adding a model.
 
 ---
 
@@ -281,6 +232,87 @@ Open WebUI's own frontend on most versions. This proxy's
 
 ---
 
+## Point Claude Code at it
+
+Claude Code decides where to send requests from two environment variables.
+You can set them once in a config file, or per terminal.
+
+### Recommended: set it once
+
+Save this as `~/.claude/settings.json` and every `claude` session on the
+machine uses the proxy -- every project, every terminal, no exports:
+
+```json
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+    "ANTHROPIC_API_KEY": "local-claude-proxy"
+  }
+}
+```
+
+- On Windows that path is `%USERPROFILE%\.claude\settings.json`.
+- For one project only, use `.claude/settings.json` inside that project.
+- **If the file already exists, merge the `env` block in** rather than
+  replacing the file.
+- Claude Code reads it at launch.
+
+The **CLI tab in the web UI generates this for you** with the right address
+already substituted, plus a copy button -- which is worth using, because the
+correct `ANTHROPIC_BASE_URL` is whatever address *the machine running
+`claude`* can reach the proxy on, and that isn't always `127.0.0.1`.
+
+`ANTHROPIC_API_KEY` is an unchecked placeholder. The proxy has no auth and
+never looks at it; Claude Code just refuses to start without something set.
+Your real provider keys live in `backends.json` on the proxy's machine.
+
+### Alternative: per terminal
+
+Applies only to the shell you run it in, and has to be repeated in every new
+one. Fine for a quick test.
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
+export ANTHROPIC_API_KEY=local-claude-proxy
+claude
+```
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8082"
+$env:ANTHROPIC_API_KEY = "local-claude-proxy"
+claude
+```
+
+### If `claude` runs on a different machine
+
+Set `PROXY_HOST` in `.env` to an interface the proxy is actually reachable
+on (a Tailscale or LAN IP), restart, and use that address as
+`ANTHROPIC_BASE_URL`. There is no auth in front of this proxy, so never bind
+it to a public interface -- see [No auth, by design](#no-auth-by-design).
+
+### Which model actually answers
+
+Claude Code sends whatever model string is active (its default, or whatever
+you set `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` to). Per backend,
+the proxy buckets on the string:
+
+- contains `haiku` → that backend's `small_model`
+- everything else (sonnet, opus, default) → that backend's `big_model`
+
+Change the mapping in `backends.json`, or from the pencil button on the
+backend's card in the **Backends** tab. A backend missing one of the two
+fields falls back to the other rather than failing.
+
+**Every model you list must support function/tool calling.** Claude Code's
+file editing and bash execution run through Anthropic tool-use blocks,
+translated here into OpenAI `tools`/`tool_calls`. A model without tool
+support won't error loudly -- Claude Code will just seem to "forget" how to
+edit files whenever failover lands on it. Check the provider's docs before
+adding a model.
+
+---
+
 ## Web UI
 
 Open `http://127.0.0.1:8082/` (or wherever you bound it). A side panel sits
@@ -292,7 +324,7 @@ next to a chat pane, with the mode switches directly above the composer.
   same history. Survives a browser reload and a proxy restart.
 - **Backends** — see [Configure backends](#configure-backends).
 - **Agent** — tool-round budget, tool groups, working directories, web-search
-  key. See [Agent tools](#agent-tools).
+  key. See [Agent mode](#agent-mode) and [Tool groups](#tool-groups).
 - **GitHub** — connect a token, browse repositories, clone one onto the
   proxy's machine with a click, read PRs and issues. The **→** button on any
   PR or issue drops a ready-made prompt into the composer.
@@ -337,15 +369,28 @@ which is what Claude Code reads to decide to compact and retry by itself.
 
 ### No auth, by design
 
-There is no login and no shared key: **anything that can reach the port can
-spend your API keys, and can switch on agent mode and get a shell on the
-machine running the proxy.** `PROXY_HOST` is the only thing limiting that.
-Keep it on `127.0.0.1`, or on a private interface (e.g. a Tailscale IP) that
-only you can reach. Never expose this port to the internet.
+There is no login and no shared key (the warning at the top of this file spells
+out what that means). It is a deliberate choice rather than an unfinished one:
+this is a single-user tool for your own machine, and a login page on it would
+be security theatre -- the threat isn't someone guessing a password, it's the
+port being reachable in the first place.
+
+So the boundary is the network, and `PROXY_HOST` is where you set it:
+
+- **`127.0.0.1`** (the default) -- only this machine. Safe anywhere.
+- **A private interface** -- a Tailscale or LAN IP, for running `claude` on a
+  different machine. Reachable by whatever else is on that network, so treat it
+  as trusted-network-only.
+- **`0.0.0.0` or a public IP** -- don't. That hands anyone on the internet your
+  API keys and a shell.
+
+If you need it reachable from somewhere untrusted, put it behind something that
+does authenticate -- a VPN, or a reverse proxy with auth in front -- rather than
+binding it wider.
 
 ---
 
-## Agent tools
+## Agent mode
 
 Lets the model in the web UI's chat actually work on the machine hosting the
 proxy: run commands, read and edit files, drive git, use GitHub, fetch from
@@ -435,7 +480,53 @@ restart. Ticking is per browser, not shared.
 > `ProtectSystem`/`ReadWritePaths`, so there is no second list to keep in sync
 > and no `daemon-reload` after adding one.
 
-### Tool groups
+### Tool rounds
+
+One message can make many tool calls; reviewing a real codebase is dozens of
+reads. The budget defaults to 100 rounds, adjustable per browser in the Agent
+tab (up to 500).
+
+Running out **does not end the chat.** The model is asked once more with no
+tools attached, so it reports what it found and what it was mid-way through,
+and a **Continue** button appears. The tool calls and their results stay in
+the conversation, so continuing resumes from the work itself rather than from
+a summary of it.
+
+Smaller models sometimes get stuck repeating one call. The third identical
+call *in a row* -- same tool, same arguments, nothing in between -- is
+answered with a nudge instead of being run again. Any different call in
+between resets that, since a write or a checkout can genuinely change what
+the repeated call would return.
+
+The budget counts *rounds*, and one round can ask for several tools at once,
+so there's a second cap of 25 calls per round. Anything past it is answered
+with an error rather than run, which keeps one confused answer from spending
+the whole budget before the loop gets to look at anything.
+
+### Using it
+
+1. Pick a backend + model that supports tool/function calling.
+2. Turn on **Agent tools**. Tick the directories the job needs and the groups
+   it should be allowed to use.
+3. Ask for something that needs the machine: *"read main.py and tell me what
+   the failover logic does"*, *"clone octo/demo and summarise its layout"*,
+   *"review PR #7 in octo/demo"*.
+4. Watch the chat: assistant text, a collapsible card per tool call showing
+   arguments and real output (failures open themselves), then the final answer.
+
+Each message re-sends the current directories, groups and switch states, so
+flipping a switch takes effect on the very next message -- there's no session
+to restart.
+
+> **The real safety boundary is the machine itself, not the sandbox switch.**
+> Even sandboxed, `bash` can `cd` elsewhere or use absolute paths -- the
+> confinement is a guardrail for the file tools, not a jail. Commands run as
+> whatever unprivileged user the proxy runs as (`claude-proxy` under systemd).
+> Run this where you'd be fine losing whatever that user can touch.
+
+---
+
+## Tool groups
 
 Tools come in groups you tick in the Agent tab, so you can hand the model a
 shell without also handing it the ability to open pull requests:
@@ -570,7 +661,9 @@ On Ollama Cloud, `gemma4:31b` works. Images ride in a user message
 straight after the round's tool results, since a tool result is text and can't
 carry one. `AGENT_MAX_IMAGE_BYTES` (5MB) caps what will be sent.
 
-### SSH hosts
+---
+
+## SSH hosts
 
 Lets agent mode reach machines *other* than the one running the proxy: run
 commands on them, and copy files each way.
@@ -673,50 +766,6 @@ Worth knowing:
 > The account and the machine are the boundary now, so run this somewhere
 > you're comfortable with that — a container or a VM, not a workstation with
 > your own files on it.
-
-### Tool rounds
-
-One message can make many tool calls; reviewing a real codebase is dozens of
-reads. The budget defaults to 100 rounds, adjustable per browser in the Agent
-tab (up to 500).
-
-Running out **does not end the chat.** The model is asked once more with no
-tools attached, so it reports what it found and what it was mid-way through,
-and a **Continue** button appears. The tool calls and their results stay in
-the conversation, so continuing resumes from the work itself rather than from
-a summary of it.
-
-Smaller models sometimes get stuck repeating one call. The third identical
-call *in a row* -- same tool, same arguments, nothing in between -- is
-answered with a nudge instead of being run again. Any different call in
-between resets that, since a write or a checkout can genuinely change what
-the repeated call would return.
-
-The budget counts *rounds*, and one round can ask for several tools at once,
-so there's a second cap of 25 calls per round. Anything past it is answered
-with an error rather than run, which keeps one confused answer from spending
-the whole budget before the loop gets to look at anything.
-
-### Using it
-
-1. Pick a backend + model that supports tool/function calling.
-2. Turn on **Agent tools**. Tick the directories the job needs and the groups
-   it should be allowed to use.
-3. Ask for something that needs the machine: *"read main.py and tell me what
-   the failover logic does"*, *"clone octo/demo and summarise its layout"*,
-   *"review PR #7 in octo/demo"*.
-4. Watch the chat: assistant text, a collapsible card per tool call showing
-   arguments and real output (failures open themselves), then the final answer.
-
-Each message re-sends the current directories, groups and switch states, so
-flipping a switch takes effect on the very next message -- there's no session
-to restart.
-
-> **The real safety boundary is the machine itself, not the sandbox switch.**
-> Even sandboxed, `bash` can `cd` elsewhere or use absolute paths -- the
-> confinement is a guardrail for the file tools, not a jail. Commands run as
-> whatever unprivileged user the proxy runs as (`claude-proxy` under systemd).
-> Run this where you'd be fine losing whatever that user can touch.
 
 ---
 
