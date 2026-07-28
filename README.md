@@ -507,13 +507,42 @@ string. So the set of machines the model can reach is exactly the set you
 typed in, and it cannot add to it. Hosts live in `ssh_hosts.json`
 (gitignored, written `chmod 600`).
 
-**Auth is key-based only.** No password is stored, and none can be typed:
-connections run with `BatchMode=yes`, `PasswordAuthentication=no` and
-`NumberOfPasswordPrompts=0`, so ssh can never sit at a prompt. Without that,
-a first-contact host key or a password request becomes a tool call that hangs
-until the timeout with nothing to explain why -- there's nobody at a terminal
-to answer it. Leave **Key file** blank to use the proxy user's default keys or
-agent, or give an absolute path to a specific one.
+**Auth is a key or a password**, per host. Leave **Key file** blank to use the
+proxy user's default keys or agent, or give an absolute path to a specific one.
+
+Prefer a key. Use a **Password** for the machines that will never have one — a
+router, an appliance, a NAS, somebody else's box — where "install a key" isn't
+advice you can act on. The tradeoff is real and worth stating plainly: the
+password is stored **in plain text** in `ssh_hosts.json`. The file is `chmod
+600` and gitignored, and the password is never returned by the API, shown in
+the UI, or visible to the model — but anyone who can read that file, or a
+backup of it, has the password.
+
+Whichever you use, ssh must never sit at a prompt: there's nobody at a
+terminal, so a prompt isn't a question, it's a tool call that hangs until the
+timeout with nothing to explain why. Without a password that means refusing to
+prompt at all (`BatchMode=yes`, `PasswordAuthentication=no`,
+`NumberOfPasswordPrompts=0`). With one it means the opposite — prompting has to
+be possible for the password to be delivered — so the guarantee is
+re-established as *exactly one* attempt, restricted to the methods a password
+can actually satisfy (`NumberOfPasswordPrompts=1`,
+`PreferredAuthentications=password,keyboard-interactive`). A wrong password
+comes back as a permission error in a couple of seconds rather than three
+retries and a wait.
+
+The password reaches ssh through `SSH_ASKPASS`, answered by `ssh_askpass.py`.
+That keeps the system `ssh` and `scp` binaries doing all the work — no
+`sshpass` to install, no second SSH implementation to keep in step — and keeps
+the password out of `argv`, which every process on the machine can read,
+putting it in the environment, which only this user and root can. The helper
+answers password prompts only; ssh uses the same mechanism to ask whether to
+accept an unrecognised host key, and a helper that answered that would hand the
+password to whoever picked up the connection. Requires OpenSSH 8.4+ on the
+proxy's machine for `SSH_ASKPASS_REQUIRE`.
+
+A password does not relax any of this. If anything it raises the stakes: a key
+is never sent to the far end and a password is, so a substituted host key with
+password auth hands over the credential itself.
 
 **Host keys use `StrictHostKeyChecking=accept-new`**: the first connection
 records the host's key, and a key that *changes* afterwards is refused

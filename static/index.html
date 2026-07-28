@@ -134,8 +134,15 @@
         <label>Key file <span class="hint">optional, absolute path</span>
           <input id="f-ssh-key" placeholder="~/.ssh/id_ed25519" autocomplete="off">
         </label>
+        <label>Password <span class="hint">only if the host has no key</span>
+          <input id="f-ssh-password" type="password" placeholder="leave blank to use a key"
+                 autocomplete="new-password">
+        </label>
         <button type="submit" class="primary-btn">Add host</button>
-        <p class="hint">Key-based auth only — no passwords are stored or accepted.</p>
+        <p class="hint">Prefer a key. A password is stored in plain text in
+          <code>ssh_hosts.json</code> (0600) — anyone who can read that file, or
+          the backups of it, has the password. It's never shown in the UI or to
+          the model.</p>
         <p class="hint error" id="ssh-error"></p>
       </form>
 

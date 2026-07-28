@@ -5,7 +5,10 @@ refuses input that would change what ssh connects to, and that the arguments
 come out as separate argv elements rather than a string a shell could reopen.
 """
 
+import json
 import os
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -144,7 +147,157 @@ def test_public_host_never_leaks_a_key(hosts):
     entry = hosts.register_host("nas", "e.com", key_path="/nonexistent/key")
     public = hosts.public_host(entry)
     assert public["key_exists"] is False
-    assert set(public) == {"name", "host", "user", "port", "label", "key_path", "key_exists"}
+    assert set(public) == {"name", "host", "user", "port", "label", "key_path",
+                           "key_exists", "has_password", "auth"}
+
+
+# ---------------------------------------------------------------------------
+# Password auth. Keys stay the default; this is for the machines that will
+# never have one -- and the thing that must not happen is the password
+# escaping the process that needs it.
+# ---------------------------------------------------------------------------
+
+def test_public_host_never_leaks_a_password(hosts):
+    """public_host is the only place a host becomes JSON, so this is the seam
+    that keeps a password out of every response and tool result."""
+    entry = hosts.register_host("nas", "e.com", user="root", password="hunter2")
+    public = hosts.public_host(entry)
+    assert "hunter2" not in json.dumps(public)
+    assert public["has_password"] is True
+    assert public["auth"] == "password"
+
+
+def test_a_password_never_becomes_an_argv_element(hosts):
+    """argv is world-readable through /proc; the environment is not."""
+    h = {"key_path": "", "password": "hunter2"}
+    assert "hunter2" not in " ".join(hosts.base_opts(h))
+    assert "hunter2" in hosts.child_env(h)["CLAUDE_PROXY_SSH_PASSWORD"]
+
+
+def test_a_password_host_allows_exactly_one_prompt(hosts):
+    """Prompting has to be possible for the helper to answer, so the no-hanging
+    guarantee is re-established with a single attempt instead."""
+    joined = " ".join(hosts.base_opts({"key_path": "", "password": "pw"}))
+    assert "BatchMode=no" in joined
+    assert "PasswordAuthentication=yes" in joined
+    assert "KbdInteractiveAuthentication=yes" in joined
+    assert "NumberOfPasswordPrompts=1" in joined
+    # Not "publickey" -- the one attempt must not be spent on a key.
+    assert "PreferredAuthentications=password,keyboard-interactive" in joined
+
+
+def test_a_password_does_not_relax_host_key_checking(hosts):
+    """If anything a password raises the stakes: a key is never sent to the far
+    end and a password is."""
+    joined = " ".join(hosts.base_opts({"key_path": "", "password": "pw"}))
+    assert "StrictHostKeyChecking=accept-new" in joined
+
+
+def test_a_key_host_gets_no_password_in_its_environment(hosts):
+    """None means inherit, so nothing is added for the common case."""
+    assert hosts.child_env({"key_path": "/k"}) is None
+
+
+def test_the_askpass_helper_is_named_by_absolute_path(hosts):
+    """Resolving it by name would hand a password to whatever is first on
+    PATH."""
+    assert os.path.isabs(hosts.ASKPASS)
+    assert hosts.child_env({"password": "pw"})["SSH_ASKPASS"] == hosts.ASKPASS
+    # Without force, ssh ignores the helper when there is no terminal.
+    assert hosts.child_env({"password": "pw"})["SSH_ASKPASS_REQUIRE"] == "force"
+
+
+@pytest.mark.parametrize("prompt, answered", [
+    ("root@nas's password: ", True),
+    ("Password: ", True),
+    ("Enter passphrase for key '/k': ", True),
+    ("Verification code: ", False),
+    ("Are you sure you want to continue connecting (yes/no/[fingerprint])? ", False),
+])
+def test_the_helper_only_answers_password_prompts(prompt, answered):
+    """ssh asks the same helper to confirm an unrecognised host key. One that
+    printed the secret regardless would hand it to whoever answered the
+    connection."""
+    result = subprocess.run(
+        [sys.executable, ssh_tools.ASKPASS, prompt],
+        capture_output=True, text=True,
+        env={**os.environ, "CLAUDE_PROXY_SSH_PASSWORD": "hunter2"},
+    )
+    assert (result.returncode == 0) is answered
+    assert ("hunter2" in result.stdout) is answered
+
+
+def test_the_helper_fails_rather_than_printing_nothing():
+    """An empty answer would be offered to the server as a password. Exiting
+    non-zero makes ssh treat the prompt as unanswered instead."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROXY_SSH_PASSWORD"}
+    result = subprocess.run(
+        [sys.executable, ssh_tools.ASKPASS, "password: "],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_passwords_with_newlines_are_refused(hosts):
+    """It would end the answer early and leave the rest to be read as whatever
+    ssh asks next -- an auth failure with no visible cause."""
+    assert hosts.validate_password("one\ntwo").startswith("[error]")
+    assert hosts.validate_password("one\0two").startswith("[error]")
+    assert hosts.validate_password("  spaces are fine  ") == ""
+
+
+def test_a_password_needs_a_username(hosts):
+    """With a key ssh can fall back to the local account name; a password
+    prompt for an unstated user is a guess nobody can debug."""
+    assert isinstance(hosts.register_host("nas", "e.com", password="pw"), str)
+    assert isinstance(hosts.register_host("nas", "e.com", user="root", password="pw"), dict)
+
+
+def test_editing_a_host_keeps_its_saved_password(hosts):
+    """The form never displays the password, so requiring it on every edit
+    would mean retyping it to change a port."""
+    hosts.register_host("nas", "e.com", user="root", password="hunter2")
+    hosts.register_host("nas", "e.com", user="root", port=2222)     # password omitted
+    assert hosts.find_host("nas")["password"] == "hunter2"
+    assert hosts.find_host("nas")["port"] == 2222
+
+
+def test_a_password_can_be_cleared(hosts):
+    hosts.register_host("nas", "e.com", user="root", password="hunter2")
+    hosts.register_host("nas", "e.com", user="root", password="")
+    assert hosts.find_host("nas")["password"] == ""
+    assert hosts.public_host(hosts.find_host("nas"))["auth"] == "key"
+
+
+def test_a_stored_password_survives_a_reload(hosts):
+    hosts.register_host("nas", "e.com", user="root", password="hunter2")
+    hosts.HOSTS[:] = hosts.load_hosts()
+    assert hosts.find_host("nas")["password"] == "hunter2"
+
+
+async def test_the_api_never_returns_a_password(client, hosts):
+    await client.post("/api/ssh-hosts", json={
+        "name": "nas", "host": "e.com", "user": "root", "password": "hunter2"})
+    listing = (await client.get("/api/ssh-hosts")).text
+    assert "hunter2" not in listing
+    assert '"has_password":true' in listing.replace(" ", "")
+
+
+async def test_a_blank_password_field_does_not_wipe_the_saved_one(client, hosts):
+    await client.post("/api/ssh-hosts", json={
+        "name": "nas", "host": "e.com", "user": "root", "password": "hunter2"})
+    await client.post("/api/ssh-hosts", json={
+        "name": "nas", "host": "e.com", "user": "root", "port": 2222, "password": ""})
+    assert hosts.find_host("nas")["password"] == "hunter2"
+
+
+async def test_clear_password_removes_it(client, hosts):
+    await client.post("/api/ssh-hosts", json={
+        "name": "nas", "host": "e.com", "user": "root", "password": "hunter2"})
+    await client.post("/api/ssh-hosts", json={
+        "name": "nas", "host": "e.com", "user": "root", "clear_password": True})
+    assert hosts.find_host("nas")["password"] == ""
 
 
 # ---------------------------------------------------------------------------

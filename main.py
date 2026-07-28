@@ -1149,6 +1149,16 @@ async def list_ssh_hosts():
 @app.post("/api/ssh-hosts")
 async def add_ssh_host(request: Request):
     body = await request.json()
+    # Same rule as a backend's API key: an absent or blank field keeps the
+    # saved password, so editing a host's port doesn't mean retyping its
+    # password into a form that has never displayed it. clear_password is the
+    # only way to remove one, because "" has to mean "unchanged" for that to
+    # work.
+    password = body.get("password")
+    if body.get("clear_password"):
+        password = ""
+    elif not password:
+        password = None
     result = ssh_tools.register_host(
         name=(body.get("name") or "").strip(),
         host=(body.get("host") or "").strip(),
@@ -1156,6 +1166,7 @@ async def add_ssh_host(request: Request):
         port=body.get("port") or 22,
         key_path=(body.get("key_path") or "").strip(),
         label=(body.get("label") or "").strip(),
+        password=password,
     )
     if isinstance(result, str):
         raise HTTPException(status_code=400, detail=result.removeprefix("[error] "))

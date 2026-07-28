@@ -33,9 +33,11 @@ function render() {
       <div class="sub">${escapeHtml(h.user ? `${h.user}@${h.host}` : h.host)}${h.port === 22 ? "" : `:${h.port}`}</div>
       <div class="tags">
         ${h.label && h.label !== h.name ? `<span class="tag">${escapeHtml(h.label)}</span>` : ""}
-        ${h.key_path
-          ? `<span class="tag ${h.key_exists ? "" : "bad"}">${h.key_exists ? "key file" : "key file missing"}</span>`
-          : `<span class="tag">default keys</span>`}
+        ${h.has_password
+          ? `<span class="tag">password</span>`
+          : h.key_path
+            ? `<span class="tag ${h.key_exists ? "" : "bad"}">${h.key_exists ? "key file" : "key file missing"}</span>`
+            : `<span class="tag">default keys</span>`}
       </div>
       <p class="hint" data-test-result></p>
     </div>
@@ -104,6 +106,10 @@ export function initSshHosts() {
           user: $("f-ssh-user").value.trim(),
           port: Number($("f-ssh-port").value) || 22,
           key_path: $("f-ssh-key").value.trim(),
+          // Not trimmed: leading and trailing spaces can be part of a
+          // password, and a form that quietly ate one would fail as a wrong
+          // password with nothing to see.
+          password: $("f-ssh-password").value,
         }),
       });
       e.target.reset();
