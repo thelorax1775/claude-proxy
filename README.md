@@ -164,6 +164,45 @@ silently vanishes from the chain. The two durations are `BACKEND_COOLDOWN` and
 Cooling can never empty the chain: if every backend is benched they're all
 tried anyway. An answer from an over-quota account beats no answer.
 
+Where a provider will say how much allowance is left, a backend that has spent
+its weekly quota is **tried last** instead of in its configured position —
+otherwise a dead free-tier key costs every single request a 429 before the
+chain moves on. This is a reorder and not a filter: the account is still tried
+if everything above it fails, because a rounded figure and a window that may
+have just rolled over are not proof it will refuse. Backends keep their
+configured order within each group, so a demotion only ever moves one past a
+backend more likely to answer, and it never happens on a guess — an unknown or
+stale figure counts as no information. `/status` lists what's currently
+`demoted`, and `BACKEND_DEMOTE_SPENT=0` turns it off. See
+[Remaining allowance](#remaining-allowance).
+
+### Remaining allowance
+
+A free-tier key that has run out doesn't announce itself: it 429s, gets
+benched, and the chain quietly gets shorter. Where the provider has an API for
+it, each backend card shows a meter for how much of its allowance is gone, and
+`GET /api/usage` returns the same thing as JSON.
+
+**Ollama Cloud** is the provider implemented. `GET https://ollama.com/api/usage`
+reports `limits.weekly.usage` as a *fraction of the weekly allowance already
+spent*, so `0.957` means 4.3% left. Anything else reports
+`supported: false` rather than guessing — adding a provider is a fetcher and
+a parser in `usage.py`.
+
+Answers are cached for two minutes and fetched concurrently; **Refresh usage**
+on the Backends tab forces a re-read, and changing a key or base URL drops that
+backend's cached figures, since a different key is a different account. None of
+it is on the request path: routing reads whatever happens to be cached and
+never waits on a provider, so a usage API being down can slow nothing and break
+nothing. The cache is kept warm by traffic rather than a timer — a busy proxy
+re-checks every couple of minutes, an idle one never does.
+
+The meter is one hue for magnitude with `--danger` reserved for the state
+change at 100%, and the number beside it always states the figure. That's
+deliberate: a red/amber/green scale built from this UI's own tokens fails
+colourblind separation (`warn`↔`ok` is ΔE 5.5 under protanopia), so the colour
+agrees with the label rather than carrying it.
+
 A conversation that no longer fits a model's context window also falls through
 to the next backend, since window sizes differ -- see
 [When a conversation gets too long](#when-a-conversation-gets-too-long).
@@ -740,7 +779,8 @@ You should see Anthropic-style SSE events (`message_start`,
 | `POST /v1/messages` | What Claude Code talks to (Anthropic → OpenAI translation) |
 | `POST /v1/messages/count_tokens` | Rough `len/4` estimate for context bookkeeping |
 | `GET /health` | Liveness plus the configured backend names |
-| `GET /status` | Last 50 backend attempts, newest last, plus what's cooling |
+| `GET /status` | Last 50 backend attempts, newest last, plus what's cooling and what's demoted |
+| `GET /api/usage` | Remaining allowance per backend; `?refresh=1` bypasses the cache |
 | `POST /api/approvals/{id}` | Answer a tool call a manual-mode run is parked on |
 | `POST /api/upload?name=&path=` | Raw-body file upload into a registered working directory |
 | `GET/POST /api/ssh-hosts` | List and register SSH hosts |

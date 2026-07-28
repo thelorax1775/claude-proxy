@@ -28,6 +28,7 @@ import github_api
 import integrations
 import sessions
 import ssh_tools
+import usage
 import web_tools
 
 app = FastAPI()
@@ -205,16 +206,81 @@ def note_failure(backend_name: str, status: int, resp=None) -> None:
         cool_down(backend_name, _retry_after(resp) or BACKEND_COOLDOWN)
 
 
+# Whether a backend whose weekly allowance is known to be gone should be tried
+# last instead of in its configured position. Set to 0 to keep the configured
+# order exactly as written.
+DEMOTE_SPENT = os.getenv("BACKEND_DEMOTE_SPENT", "1").strip().lower() not in ("0", "false", "no")
+
+# Set while a background usage re-read is in flight, so a busy proxy starts one
+# refresh rather than one per request.
+_usage_refresh: asyncio.Task | None = None
+
+
+def warm_usage_cache() -> None:
+    """Kick off a usage re-read if the figures have gone stale, and return
+    immediately.
+
+    Routing reads the usage cache but must never wait on it, so something has
+    to keep it warm. Doing it here means it is traffic that pays for it: a busy
+    proxy re-checks every couple of minutes, an idle one never does, and there
+    is no timer to manage or shut down. Failure is silent -- this decides
+    whether a spent backend is tried first or last, and getting that wrong is
+    not worth a failed request.
+    """
+    global _usage_refresh
+    if not DEMOTE_SPENT or not usage.needs_refresh(BACKENDS):
+        return
+    if _usage_refresh is not None and not _usage_refresh.done():
+        return
+    try:
+        # Checked before the coroutine is built, not after: calling run() with
+        # no loop to hand it to leaves an un-awaited coroutine behind.
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def run():
+        try:
+            async with upstream_client() as client:
+                await usage.for_all(client, BACKENDS)
+        except Exception as e:
+            log.warning("background usage refresh failed: %s", e)
+
+    _usage_refresh = asyncio.create_task(run())
+
+
+def demote_spent(items, name_of):
+    """Backends whose allowance is known to be gone, moved to the back.
+
+    Deliberately a reorder and not a filter. A spent account still answers
+    sometimes -- the figure is rounded, the window may have just rolled over,
+    and some providers keep serving at reduced priority -- so removing it could
+    turn a slow request into a failed one. Demoting costs nothing when the
+    others work and loses nothing when they don't.
+
+    Both groups keep their configured relative order, so this only ever moves
+    a backend past one that is actually more likely to answer.
+    """
+    if not DEMOTE_SPENT or len(items) < 2:
+        return items
+    ready = [i for i in items if not usage.is_spent(name_of(i))]
+    if not ready or len(ready) == len(items):
+        return items          # nothing known to be spent, or all of them are
+    return ready + [i for i in items if usage.is_spent(name_of(i))]
+
+
 def usable_backends(items, name_of):
-    """`items` minus anything currently cooling down. If that would leave
-    nothing, every one of them is returned instead: an answer from an
-    over-quota account beats no answer at all, and the whole point of the
-    chain is that it doesn't dead-end."""
+    """`items` minus anything currently cooling down, with anything out of
+    quota moved to the back. If dropping the cooling ones would leave nothing,
+    every one of them is returned instead: an answer from an over-quota account
+    beats no answer at all, and the whole point of the chain is that it doesn't
+    dead-end."""
+    warm_usage_cache()
     usable = [i for i in items if not cooling_for(name_of(i))]
-    if usable or not items:
-        return usable
-    record_attempt("(chain)", "every backend cooling down -- trying anyway")
-    return list(items)
+    if not usable and items:
+        record_attempt("(chain)", "every backend cooling down -- trying anyway")
+        usable = list(items)
+    return demote_spent(usable, name_of)
 
 
 # ---------------------------------------------------------------------------
@@ -806,15 +872,34 @@ async def health():
     }
 
 
+@app.get("/api/usage")
+async def backend_usage(refresh: int = 0):
+    """How much of each backend's allowance is left, where the provider will
+    say. Separate from /api/backends because it costs a round trip per backend
+    -- listing backends stays instant, and the Backends tab asks for this
+    after it has drawn the cards.
+
+    Answers are cached (see usage.TTL_SECONDS); ?refresh=1 forces a re-read.
+    """
+    async with upstream_client() as client:
+        rows = await usage.for_all(client, BACKENDS, force=bool(refresh))
+    return {"backends": rows, "ttl": usage.TTL_SECONDS}
+
+
 @app.get("/status")
 async def status():
     """Recent backend attempts -- watch failover happen in real time -- plus
     which backends are currently benched and for how long, so a backend that
-    has quietly dropped out of the chain is visible rather than mysterious."""
+    has quietly dropped out of the chain is visible rather than mysterious.
+
+    `demoted` is the same idea for the other reason a backend isn't where you
+    put it: its allowance is spent, so it is tried last."""
     return {
         "recent_attempts": list(ATTEMPT_LOG),
         "cooling": {b["name"]: cooling_for(b["name"]) for b in BACKENDS
                     if cooling_for(b["name"])},
+        "demoted": [b["name"] for b in BACKENDS
+                    if DEMOTE_SPENT and usage.is_spent(b["name"])],
     }
 
 
@@ -889,6 +974,7 @@ async def update_backend(name: str, request: Request):
             if any(other["name"] == new_name for other in BACKENDS):
                 raise HTTPException(status_code=409, detail=f"backend '{new_name}' already exists")
             clear_cooldown(name)   # cooldown is keyed by name; don't strand it
+            usage.forget(name)     # so is the usage cache
             b["name"] = new_name
 
         if "api_key" in body:
@@ -900,11 +986,16 @@ async def update_backend(name: str, request: Request):
                 # benched; making them wait out the auth cooldown would be
                 # absurd.
                 clear_cooldown(b["name"])
+            # A different key is a different account, so the cached figures
+            # belong to something else now.
+            usage.forget(b["name"])
 
         for field in ("base_url", "big_model", "small_model"):
             if field in body and isinstance(body[field], str):
                 value = body[field].strip()
                 b[field] = value.rstrip("/") if field == "base_url" else value
+                if field == "base_url":
+                    usage.forget(b["name"])
 
         save_backends()
         return public_backend(b)
@@ -917,6 +1008,7 @@ async def delete_backend(name: str):
         if b["name"] == name:
             del BACKENDS[i]
             clear_cooldown(name)
+            usage.forget(name)
             save_backends()
             return {"ok": True}
     raise HTTPException(status_code=404, detail=f"backend '{name}' not found")

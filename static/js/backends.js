@@ -42,6 +42,66 @@ function fillPresets() {
 // into the wrong backend.
 let editing = null;
 
+// name -> usage row from /api/usage. Kept apart from store.backends because it
+// arrives later and can fail on its own: the list must draw immediately with
+// whatever the proxy already knows, and gain the meters when they show up.
+let usageByName = {};
+
+/** At or above this, treat the allowance as gone. The provider reports a
+ *  rounded fraction, so 0.999 and 1.0 mean the same thing in practice. */
+const SPENT_AT = 99.5;
+
+function meterFor(name) {
+  const u = usageByName[name];
+  if (!u) return "";
+
+  if (u.supported === false) {
+    return `<div class="meter"><span class="meter-unknown"
+      title="${escapeHtml(u.reason || "")}">usage not reported by this provider</span></div>`;
+  }
+  if (u.error) {
+    return `<div class="meter"><span class="meter-unknown">usage unavailable — ${escapeHtml(u.error)}</span></div>`;
+  }
+  if (typeof u.used_pct !== "number") return "";
+
+  const spent = u.used_pct >= SPENT_AT;
+  // The bar shows magnitude; this string is what actually states it, so it is
+  // never omitted and never the only thing that changes colour.
+  const label = spent ? "weekly quota spent" : `${u.remaining_pct}% left this week`;
+
+  const detail = [
+    `${u.used_pct}% of the weekly allowance used`,
+    u.requests ? `${u.requests} requests` : "",
+    (u.models || []).map((m) => `${m.name}: ${m.requests}`).join(", "),
+    typeof u.session_pct === "number" ? `session window ${u.session_pct}%` : "",
+    u.checked_at ? `checked ${new Date(u.checked_at * 1000).toLocaleTimeString()}` : "",
+  ].filter(Boolean).join(" · ");
+
+  return `
+    <div class="meter ${spent ? "is-spent" : ""}" title="${escapeHtml(detail)}">
+      <div class="meter-track" role="meter" aria-valuemin="0" aria-valuemax="100"
+           aria-valuenow="${u.used_pct}"
+           aria-label="${escapeHtml(`${name}: ${label}`)}">
+        <div class="meter-fill" style="width: ${u.used_pct}%"></div>
+      </div>
+      <span class="meter-value">${escapeHtml(label)}</span>
+    </div>`;
+}
+
+/** Fetched after the cards are drawn, so a slow provider never delays the
+ *  list. Failure is silent by design -- the cards are still correct without
+ *  it, and a red banner over "we couldn't tell you a nice-to-have number"
+ *  would be worse than no number. */
+export async function loadUsage({ refresh = false } = {}) {
+  try {
+    const data = await api(`/api/usage${refresh ? "?refresh=1" : ""}`);
+    usageByName = Object.fromEntries((data.backends || []).map((u) => [u.name, u]));
+    render();
+  } catch {
+    /* leave the cards as they are */
+  }
+}
+
 function editForm(b) {
   return `
     <form class="form edit-form" data-edit>
@@ -96,6 +156,7 @@ function render() {
         <span class="tag ${b.has_key ? "accent" : ""}">${b.has_key ? "key set" : "no key"}</span>
         ${b.cooling ? `<span class="tag bad" title="Skipped until it's had a rest — it recently rate-limited or rejected its key">cooling ${b.cooling}s</span>` : ""}
       </div>
+      ${meterFor(b.name)}
       ${editing === b.name ? editForm(b) : ""}
     </div>
   `).join("");
@@ -210,6 +271,8 @@ export async function loadBackends() {
     const data = await api("/api/backends");
     store.backends = data.backends;
     render();
+    // Not awaited: the meters fill in when the providers answer.
+    loadUsage();
   } catch (err) {
     store.backends = [];
     $("backend-list").innerHTML =
@@ -242,6 +305,16 @@ export function initBackends() {
     } catch (err) {
       $("add-error").textContent = err.message;
     }
+  };
+
+  $("refresh-usage").onclick = async (e) => {
+    const btn = e.target;
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "Checking…";
+    await loadUsage({ refresh: true });
+    btn.textContent = original;
+    btn.disabled = false;
   };
 
   $("detect-btn").onclick = async () => {

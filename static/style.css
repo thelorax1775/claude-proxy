@@ -276,6 +276,57 @@ a.icon-btn { text-decoration: none; display: inline-block; }
 .tag.bad { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
 .tag.good { color: var(--ok); }
 
+/* ---------- usage meter ----------
+   How much of a backend's weekly allowance is gone. One hue for the bar,
+   because this is a magnitude and not a category; --danger only for the state
+   change at the end, which is a different thing and not merely more of the
+   same. Deliberately not a three-colour traffic light: ok/warn/danger sit too
+   close together to be told apart under protanopia (and warn/danger are close
+   even with full colour vision), so the number beside the bar is what actually
+   reports the state -- the colour agrees with it rather than carrying it. */
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.45rem;
+}
+
+.meter-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.meter.is-spent .meter-fill { background: var(--danger); }
+
+/* Text wears text ink, never the bar's colour -- the bar carries magnitude,
+   the label carries the value. */
+.meter-value {
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.meter.is-spent .meter-value { color: var(--text); font-weight: 600; }
+
+.meter-unknown {
+  font-size: 0.7rem;
+  color: var(--faint);
+  font-style: italic;
+}
+
 .pick {
   display: flex;
   flex-direction: row; /* wins over the column default on <label> */
