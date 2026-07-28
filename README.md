@@ -442,14 +442,16 @@ shell without also handing it the ability to open pull requests:
 
 | group | n | tools |
 | --- | --- | --- |
-| Shell | 1 | `bash` |
+| Tasks | 1 | `write_todos` |
+| Sub-agents | 1 | `spawn_agent` |
+| Shell | 3 | `bash`, `bash_output`, `kill_shell` |
 | Files | 6 | `read_file`, `write_file`, `edit_file`, `list_dir`, `search_files`, `find_files` |
-| Files: move & delete | 2 | `move_file`, `delete_file` |
+| Files: move & delete | 3 | `move_file`, `delete_file`, `notebook_edit` |
 | Git | 12 | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_commit`, `git_checkout`, `git_push`, `git_fetch`, `git_pull`, `git_show`, `git_stash`, `git_restore` |
 | GitHub | 11 | `github_list_repos`, `github_clone`, `github_list_prs`, `github_read_pr`, `github_list_issues`, `github_read_issue`, `github_ci`, `github_read_file`, `github_list_branches`, `github_search_code`, `github_read_commit` |
 | GitHub write | 7 | `github_create_issue`, `github_comment`, `github_create_pr`, `github_merge_pr`, `github_review_pr`, `github_close_issue`, `github_write_file` |
 | Web | 3 | `web_fetch`, `web_search`, `http_request` |
-| SSH | 4 | `ssh_list_hosts`, `ssh_run`, `ssh_upload`, `ssh_download` |
+| SSH | 5 | `ssh_list_hosts`, `ssh_add_host`, `ssh_run`, `ssh_upload`, `ssh_download` |
 
 Unticked groups aren't offered to the model at all, and are refused
 server-side if it invents a call anyway. **The tick is the only gate.** No
@@ -461,13 +463,17 @@ control you came to use while you set the credential up. Unticking *every*
 group is allowed and means what it says: no tools, so the message is an
 ordinary chat.
 
-**Three groups are off by default**, because they do things you can't take
-back:
+**Four groups are off by default.** Three do things you can't take back; the
+fourth spends money:
 
 - **Files: move & delete** -- `delete_file` removes one file at a time and
   refuses directories outright, so there's no recursive tree delete to get
   wrong. Read and edit live in the ordinary Files group, so you can hand over
-  editing without handing over deletion.
+  editing without handing over deletion. `notebook_edit` is here because it
+  writes to somebody's working file.
+- **Sub-agents** -- `spawn_agent` starts a whole second model conversation, so
+  one message can cost several times what it looks like. See
+  [Sub-agents](#sub-agents).
 - **GitHub write** -- publicly visible actions. `github_merge_pr` and
   `github_review_pr` are the two worth thinking about before ticking: an
   approval can be what allows a merge.
@@ -494,7 +500,75 @@ Things worth knowing about individual tools:
   through the same redirect-checked destination guard, so both respect the
   LAN switch.
 - `bash` takes an optional `timeout` (default 30s, up to 300). Raise it for a
-  build or a test suite rather than watching the default cut one short.
+  build or a test suite rather than watching the default cut one short -- or
+  better, background it (below).
+- `read_file` handles a `.ipynb` as cells rather than raw JSON, and a `.pdf` as
+  extracted text with page markers. A PDF with no text layer says so and names
+  OCR as the reason, instead of returning nothing and inviting a guess.
+- `notebook_edit` changes one cell and leaves every other cell's source,
+  outputs and metadata alone. `write_file` on a notebook technically works and
+  silently discards all of that.
+- `write_todos` is the model's checklist. Only one task may be `in_progress`,
+  and the run reports anything still open when it finishes -- so "did it
+  actually do all six things" is visible rather than inferred from the summary.
+
+### Long-running commands
+
+`bash(run_in_background=true)` returns an id immediately and leaves the command
+running between turns. Collect output with `bash_output` (only what's new since
+last time, unless you ask for everything) and stop it with `kill_shell`.
+
+Use it for anything that takes more than a few seconds -- a build, a test
+suite, a package upgrade -- and for anything that never exits, like a dev
+server, which no timeout can express.
+
+Output is drained continuously into a capped buffer rather than left in a pipe,
+because a process whose pipe fills up blocks forever and a background job that
+silently wedges at 64KB would be worse than not having the feature. When the
+cap is reached the *front* is dropped, since for a build log the tail is the
+part that says what went wrong, and the reader is told bytes went missing.
+
+`kill_shell` signals the process group, not just the shell: a shell that ran
+`npm start` is a shell whose *child* holds the port. The proxy also kills
+everything still running when it shuts down, so a restart doesn't find its own
+port taken by the last run.
+
+Tunable with `AGENT_BG_MAX_SHELLS` (default 8), `AGENT_BG_OUTPUT_LIMIT`
+(200000 bytes) and `AGENT_BG_KEEP_FINISHED` (1800s -- how long a finished
+shell's output is kept for collection).
+
+### Sub-agents
+
+`spawn_agent` hands one self-contained task to a nested run and returns only
+its answer. The point is context, not speed: "which of these forty files
+defines the retry policy" costs a dozen rounds of tool output that are
+worthless once answered, and every one of them would otherwise sit in the
+conversation for the rest of the run.
+
+**The sub-agent sees only the brief.** Not the conversation, not what has
+already been tried, not why you're asking. That's the whole trade, and it means
+a vague brief gets a confident answer to a question nobody asked -- with no way
+for the parent to tell. Briefs shorter than a sentence are refused.
+
+Permissions only ever narrow: a child gets its parent's groups minus
+`spawn_agent` itself, and asking for a group the parent doesn't have drops it.
+Depth (`AGENT_MAX_DEPTH`, default 1 -- children can't spawn their own) and
+count per run (`AGENT_MAX_SPAWNS`, default 4) are both capped, and both are
+checked before a child exists, so a refusal costs nothing.
+
+### Images
+
+`read_file` on a `.png`/`.jpg`/etc. can show the model the image, but only if
+the model can actually take one -- most can't. `nemotron-3-ultra` answers HTTP
+400 and takes the *whole request* down with it, not just that tool call, so the
+model name is checked against `AGENT_VISION_MODELS` first (substring match,
+deliberately conservative). A model that can't see one is told to say so rather
+than guess; a confident description of an image nobody looked at is the worst
+outcome available.
+
+On Ollama Cloud, `gemma4:31b` works. Images ride in a user message
+straight after the round's tool results, since a tool result is text and can't
+carry one. `AGENT_MAX_IMAGE_BYTES` (5MB) caps what will be sent.
 
 ### SSH hosts
 
