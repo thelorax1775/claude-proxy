@@ -57,8 +57,8 @@ which backend served each request.
 
 Two optional command-line tools, only for agent mode: `git` for the git and
 GitHub tool groups, and an OpenSSH client (`ssh`/`scp`) for the SSH group.
-Each group reports itself unavailable rather than failing if its tool is
-missing.
+If one is missing the group still ticks; the tool that needs it says so when
+it runs.
 
 ---
 
@@ -398,13 +398,14 @@ shell without also handing it the ability to open pull requests:
 | SSH | 4 | `ssh_list_hosts`, `ssh_run`, `ssh_upload`, `ssh_download` |
 
 Unticked groups aren't offered to the model at all, and are refused
-server-side if it invents a call anyway. The GitHub groups are the only ones
-that can be unavailable rather than merely unticked -- every one of their
-tools is a call against an authenticated API, so without a token there is
-nothing to offer. SSH is an ordinary toggle: tick it whenever you like, and
-with no hosts registered the tools just have nowhere to go and say so.
-Unticking *every* group is allowed and means what it says: no tools, so the
-message is an ordinary chat.
+server-side if it invents a call anyway. **The tick is the only gate.** No
+group is ever greyed out or withheld: tick GitHub before connecting a token,
+or SSH before registering a host, and the tools will tell you what's missing
+when they run -- "no GitHub token configured -- add one in the UI's Agent tab"
+is a more useful answer than a disabled checkbox, and it doesn't disable the
+control you came to use while you set the credential up. Unticking *every*
+group is allowed and means what it says: no tools, so the message is an
+ordinary chat.
 
 **Three groups are off by default**, because they do things you can't take
 back:

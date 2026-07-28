@@ -1,5 +1,6 @@
-// Tool groups: which families of tools a run may call. The server decides
-// what's *available* (GitHub needs a token); the boxes decide what's used.
+// Tool groups: which families of tools a run may call. The boxes are the only
+// thing deciding that -- nothing here is ever disabled on your behalf. A group
+// whose credential is missing still ticks; the tool says so when it runs.
 
 import { api } from "./api.js";
 import { $, escapeHtml } from "./ui.js";
@@ -16,17 +17,10 @@ const LABELS = {
   ssh: ["SSH", "run commands and copy files on registered remote hosts"],
 };
 
-// Fallback only: the server sends a `reason` per group, which is the thing
-// actually shown. Only the GitHub groups can be unavailable at all.
-const NEEDS = {
-  github: "needs a GitHub token",
-  github_write: "needs a GitHub token",
-};
-
-/** Groups this session wants, minus anything the server can't offer. */
+/** Groups this session wants. */
 export function selectedGroups() {
   return store.settings.groups
-    .filter((g) => g.available && store.groups.has(g.name))
+    .filter((g) => store.groups.has(g.name))
     .map((g) => g.name);
 }
 
@@ -65,18 +59,17 @@ function render() {
   const list = $("group-list");
   list.innerHTML = store.settings.groups.map((group) => {
     const [label, blurb] = LABELS[group.name] || [group.name, ""];
-    const on = group.available && store.groups.has(group.name);
+    const on = store.groups.has(group.name);
     return `
       <div class="card group-card ${on ? "is-selected" : ""}" data-group="${escapeHtml(group.name)}">
         <div class="row">
           <label class="pick">
-            <input type="checkbox" ${on ? "checked" : ""} ${group.available ? "" : "disabled"}>
+            <input type="checkbox" ${on ? "checked" : ""}>
             <span class="title">${escapeHtml(label)}</span>
           </label>
           <span class="hint">${group.tools.length} tool${group.tools.length === 1 ? "" : "s"}</span>
         </div>
         <div class="sub plain">${escapeHtml(blurb)}</div>
-        ${group.available ? "" : `<div class="tags"><span class="tag bad">${escapeHtml(group.reason || NEEDS[group.name] || "unavailable")}</span></div>`}
       </div>`;
   }).join("");
 

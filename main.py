@@ -940,7 +940,6 @@ async def ui_settings():
     toggles are the browser's call; lan_available is the one thing here that
     does bound a toggle, since reaching the local network is the operator's
     decision rather than the browser's."""
-    usable = agent_tools.available_groups()
     return {
         "max_agent_iterations": MAX_AGENT_ITERATIONS,
         "round_ceiling": agent_tools.ROUND_CEILING,
@@ -954,13 +953,12 @@ async def ui_settings():
         # shows the switch either way, but locks it when this is false rather
         # than offering a toggle that silently can't take effect.
         "lan_available": web_tools.ALLOW_PRIVATE_CEILING,
+        # No "available" flag: a group is never withheld from the UI. Whether
+        # a credential is missing is the tool's own error to report when it
+        # runs, not a reason to disable the box you'd tick to set it up.
         "groups": [
             {
                 "name": group,
-                "available": usable.get(group, False),
-                # Why not, so the UI can say rather than guess -- a group can
-                # now be unavailable for more than one reason.
-                "reason": agent_tools.group_unavailable_reason(group),
                 "tools": [t["name"] for t in agent_tools.TOOLS if t["group"] == group],
             }
             for group in agent_tools.GROUPS

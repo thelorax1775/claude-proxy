@@ -205,45 +205,28 @@ class AgentContext:
         return group in self.groups
 
 
-def available_groups() -> dict:
-    """Which groups are usable right now. GitHub needs a token because every
-    one of its tools is a call against an authenticated API; web search needs a
-    provider key, though web_fetch works without one.
-
-    Nothing else is gated. ssh in particular is an ordinary toggle: an empty
-    host registry makes it useless, not unavailable, and ssh_list_hosts says so
-    in a sentence. Withholding the checkbox until the registry was populated
-    only meant the Agent tab disabled the very control you were looking for
-    while you set it up."""
-    has_github = bool(integrations.get("github_token"))
-    return {
-        "shell": True,
-        "files": True,
-        "files_write": True,
-        "git": True,
-        "github": has_github,
-        "github_write": has_github,
-        "web": True,
-        "ssh": True,
-    }
-
-
-def group_unavailable_reason(group: str) -> str:
-    """Why a group can't be used, for the UI to show instead of guessing.
-    Empty when it is usable."""
-    if available_groups().get(group):
-        return ""
-    if group in ("github", "github_write"):
-        return "needs a GitHub token"
-    return ""
+# There is deliberately no notion of a group being "unavailable" any more.
+#
+# Availability was a second gate in front of the checkbox: GitHub needed a
+# token, ssh needed a registered host, and the Agent tab disabled the control
+# until you satisfied it. That put the answer in the wrong place. Whether a
+# credential exists is something the tool discovers when it runs, and every
+# tool here already reports it well -- the GitHub tools raise "no GitHub token
+# configured -- add one in the UI's Agent tab", ssh_list_hosts says the
+# registry is empty, web_search names the missing provider key. A greyed-out
+# box, by contrast, tells you nothing about what to do and disables the very
+# control you came to use while you set the credential up.
+#
+# So the tick is the only gate. What a group can actually do when you tick it
+# is between you and the tool's own error message.
 
 
 def build_agent_context(requested_paths, sandbox_requested: bool, requested_groups=None,
                         lan_requested: bool = False, approval: str = "skip") -> AgentContext:
-    """Map what the browser asked for onto directories and groups that are
-    actually available. Unknown paths and unusable groups are dropped rather
-    than trusted -- a session picks from the registry, it doesn't invent
-    entries mid-request."""
+    """Map what the browser asked for onto directories and groups this build
+    actually has. Unknown paths and unknown group names are dropped rather than
+    trusted -- a session picks from the registry, it doesn't invent entries
+    mid-request."""
     registered = [d["path"] for d in WORKDIRS]
     roots = []
     for p in requested_paths or []:
@@ -255,13 +238,13 @@ def build_agent_context(requested_paths, sandbox_requested: bool, requested_grou
     if not roots:
         roots = [AGENT_WORKSPACE]
 
-    usable = available_groups()
     # Only an absent/malformed selection falls back to the defaults. An
-    # explicit empty list means "no tools", and a selection whose groups are
-    # all unavailable means "nothing usable" -- neither may quietly turn into
-    # a shell. The run just has no tools to offer, which is a plain chat.
+    # explicit empty list means "no tools" and must stay that way rather than
+    # quietly turning back into a shell: the run simply has nothing to offer,
+    # which is a plain chat. Filtering against GROUPS drops names this build
+    # doesn't have, which is all the filtering left to do.
     asked = requested_groups if isinstance(requested_groups, list) else DEFAULT_GROUPS
-    groups = [g for g in GROUPS if g in asked and usable.get(g)]
+    groups = [g for g in GROUPS if g in asked]
 
     # lan_allowed clamps the browser's request against AGENT_WEB_ALLOW_PRIVATE,
     # so a request asking for the LAN when the operator hasn't allowed it just
@@ -1295,18 +1278,15 @@ def group_of(name: str) -> str:
 
 
 def tools_for(ctx: AgentContext) -> list[dict]:
-    """The OpenAI-format tool specs this run is allowed to use. web_search is
-    dropped when no search key is set, so the model isn't offered a tool that
-    can only fail."""
-    specs = []
-    has_search_key = bool(integrations.get("search_api_key"))
-    for tool in TOOLS:
-        if not ctx.allows(tool["group"]):
-            continue
-        if tool["name"] == "web_search" and not has_search_key:
-            continue
-        specs.append(tool["spec"])
-    return specs
+    """The OpenAI-format tool specs this run is allowed to use -- which is
+    exactly what the ticked groups say, and nothing else.
+
+    web_search used to be dropped here when no search key was set. It is
+    offered now: web_tools.web_search answers "no search API key configured --
+    add one in the UI's Agent tab", which tells the model something true it
+    can pass on, where a silently absent tool just made it guess why searching
+    wasn't working."""
+    return [tool["spec"] for tool in TOOLS if ctx.allows(tool["group"])]
 
 
 async def execute_tool_call(ctx: AgentContext, name: str, args: dict) -> str:

@@ -77,10 +77,9 @@ function renderPlusMenu() {
 
   const groups = $("menu-groups");
   groups.innerHTML = (store.settings.groups || []).map((g) => `
-      <label class="menu-check ${g.available ? "" : "is-locked"}">
+      <label class="menu-check">
         <input type="checkbox" data-group="${escapeHtml(g.name)}"
-          ${g.available && store.groups.has(g.name) ? "checked" : ""}
-          ${g.available ? "" : "disabled"}>
+          ${store.groups.has(g.name) ? "checked" : ""}>
         <span>${escapeHtml(g.name)}</span>
         <em>${g.tools.length}</em>
       </label>`).join("");

@@ -192,39 +192,45 @@ def test_bash_timeouts_are_clamped():
 
 
 # ---------------------------------------------------------------------------
-# Group availability -- an ordinary toggle, gated on nothing
+# The tick is the only gate
 # ---------------------------------------------------------------------------
 
-def test_the_group_is_available_with_no_hosts(hosts, monkeypatch):
-    """An empty registry makes the tools useless, not unavailable. Disabling
-    the checkbox until a host existed meant the Agent tab greyed out the
-    control you were there to use."""
-    monkeypatch.setattr(hosts, "ssh_available", lambda: True)
-    assert agent_tools.available_groups()["ssh"] is True
-    assert agent_tools.group_unavailable_reason("ssh") == ""
+def test_the_group_survives_with_no_hosts(hosts):
+    """An empty registry makes the tools useless, not unavailable. Dropping
+    the group server-side meant the tick you just made silently didn't take."""
+    ctx = agent_tools.build_agent_context(None, True, ["ssh"])
+    assert ctx.allows("ssh")
 
 
-def test_the_group_is_available_without_an_ssh_binary(hosts, monkeypatch):
+def test_the_group_survives_without_an_ssh_binary(hosts, monkeypatch):
     """A missing ssh client is reported by the tool that tries to use it, the
     same way a missing git is -- it doesn't take the group away."""
     hosts.register_host("nas", "e.com")
     monkeypatch.setattr(hosts, "ssh_available", lambda: False)
-    assert agent_tools.available_groups()["ssh"] is True
-    assert agent_tools.group_unavailable_reason("ssh") == ""
-
-
-def test_the_group_stays_available_with_a_host(hosts, monkeypatch):
-    hosts.register_host("nas", "e.com")
-    monkeypatch.setattr(hosts, "ssh_available", lambda: True)
-    assert agent_tools.available_groups()["ssh"] is True
-    assert agent_tools.group_unavailable_reason("ssh") == ""
-
-
-def test_the_group_can_be_selected_with_an_empty_registry(hosts):
-    """build_agent_context drops unusable groups, so 'available' has to hold
-    for the tick to survive the round trip to the server."""
     ctx = agent_tools.build_agent_context(None, True, ["ssh"])
     assert ctx.allows("ssh")
+
+
+def test_github_survives_without_a_token(monkeypatch):
+    """The last credential gate. Every GitHub tool raises a GitHubError naming
+    the missing token, which is a better answer than a disabled checkbox."""
+    monkeypatch.setattr(agent_tools.integrations, "get", lambda *a: "")
+    ctx = agent_tools.build_agent_context(None, True, ["github", "github_write"])
+    assert ctx.allows("github") and ctx.allows("github_write")
+
+
+def test_an_unknown_group_name_is_still_dropped():
+    """Filtering against GROUPS is the one thing build_agent_context still
+    does -- a name this build doesn't have can't become a tool."""
+    ctx = agent_tools.build_agent_context(None, True, ["ssh", "nonsense"])
+    assert ctx.groups == ["ssh"]
+
+
+def test_an_explicit_empty_selection_stays_empty():
+    """Unticking everything is a thing you're allowed to mean; it must not
+    fall back to the defaults and hand the model a shell."""
+    ctx = agent_tools.build_agent_context(None, True, [])
+    assert ctx.groups == []
 
 
 def test_the_prompt_says_what_to_do_when_no_host_is_registered(hosts):
@@ -366,10 +372,14 @@ async def test_testing_an_unknown_host_is_404(client):
     assert (await client.post("/api/ssh-hosts/nope/test")).status_code == 404
 
 
-async def test_settings_reports_the_ssh_group_as_available(client):
+async def test_settings_lists_every_group_with_no_availability_flag(client):
     settings = (await client.get("/api/settings")).json()
+    assert [g["name"] for g in settings["groups"]] == agent_tools.GROUPS
+
     group = next(g for g in settings["groups"] if g["name"] == "ssh")
-    assert group["available"] is True
-    assert not group["reason"]
     assert set(group["tools"]) == {"ssh_list_hosts", "ssh_run", "ssh_upload", "ssh_download"}
     assert settings["ssh_timeout"] and settings["ssh_max_timeout"]
+
+    # Nothing is withheld from the UI, so there is no flag for it to read.
+    for g in settings["groups"]:
+        assert "available" not in g and "reason" not in g
