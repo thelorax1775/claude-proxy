@@ -22,6 +22,7 @@ import shlex
 import shutil
 import sys
 
+import background
 import git_tools
 import github_api
 import integrations
@@ -286,12 +287,20 @@ def clamp_tool_timeout(requested) -> int:
     return max(1, min(value, BASH_MAX_TIMEOUT))
 
 
-async def run_bash(ctx, command: str, cwd: str = "", timeout=None) -> str:
+async def run_bash(ctx, command: str, cwd: str = "", timeout=None,
+                   run_in_background: bool = False) -> str:
     seconds = clamp_tool_timeout(timeout)
     try:
         workdir = resolve_agent_path(ctx, cwd) if cwd else ctx.cwd
         if not os.path.isdir(workdir):
             return f"[error] working directory '{workdir}' does not exist"
+        if run_in_background:
+            shell = await background.start(command, workdir)
+            if isinstance(shell, str):
+                return shell
+            return (f"Started {shell.id} in the background.\n"
+                    f"Collect its output with bash_output {shell.id}, or stop it with "
+                    f"kill_shell {shell.id}. It keeps running between your turns.")
         proc = await asyncio.create_subprocess_shell(
             command, cwd=workdir,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -312,6 +321,38 @@ async def run_bash(ctx, command: str, cwd: str = "", timeout=None) -> str:
         return github_api.scrub(_truncate(status + (text or "(no output)")))
     except Exception as e:
         return f"[error] {e}"
+
+
+async def run_bash_output(ctx, shell_id: str = "", only_new: bool = True) -> str:
+    """Collect what a background shell has produced.
+
+    Defaults to only what's new since the last read, because the alternative --
+    re-reading a growing build log every time -- costs a round's worth of
+    context to learn one new line.
+    """
+    if not (shell_id or "").strip():
+        shells = background.listing()
+        if not shells:
+            return "No background shells. Start one with bash(run_in_background=true)."
+        return "\n".join(f"{s.id}: {s.status()}  -- {s.command[:70]}" for s in shells)
+
+    shell = background.get(shell_id)
+    if shell is None:
+        known = ", ".join(s.id for s in background.listing()) or "none"
+        return f"[error] no background shell called '{shell_id}'. Known: {known}."
+    text = shell.read(only_new=bool(only_new))
+    header = f"[{shell.id}: {shell.status()}]"
+    if not text:
+        return f"{header}\n(no new output)" if only_new else f"{header}\n(no output)"
+    return github_api.scrub(_truncate(f"{header}\n{text}"))
+
+
+async def run_kill_shell(ctx, shell_id: str) -> str:
+    shell = background.get(shell_id)
+    if shell is None:
+        known = ", ".join(s.id for s in background.listing()) or "none"
+        return f"[error] no background shell called '{shell_id}'. Known: {known}."
+    return await background.kill(shell)
 
 
 async def run_read_file(ctx, path: str, offset: int = 0, limit: int = 0) -> str:
@@ -1105,8 +1146,18 @@ TOOLS = [
           "Run a shell command. Runs in the session's primary working directory unless 'cwd' says otherwise. Output (stdout+stderr) is truncated if large.",
           {"command": {**STR, "description": "Shell command to run"},
            "cwd": {**STR, "description": "Directory to run in; must be inside a working directory while sandboxed"},
-           "timeout": {**INT, "description": f"Seconds to allow; defaults to {AGENT_TOOL_TIMEOUT}, max {BASH_MAX_TIMEOUT}. Raise it for builds and test suites."}},
+           "timeout": {**INT, "description": f"Seconds to allow; defaults to {AGENT_TOOL_TIMEOUT}, max {BASH_MAX_TIMEOUT}. Raise it for builds and test suites."},
+           "run_in_background": {**BOOL, "description": "Return an id immediately and leave it running. Use for anything long (builds, test suites, package upgrades) or that never exits (servers), then collect with bash_output. 'timeout' does not apply."}},
           ["command"], run_bash),
+    _tool("shell", "bash_output",
+          "Collect output from a background shell. Returns only what is new since your last read unless only_new is false. Call with no shell_id to list every background shell and whether it is still running.",
+          {"shell_id": {**STR, "description": "The id from bash(run_in_background=true), e.g. 'bg_1'. Omit to list them all."},
+           "only_new": {**BOOL, "description": "Default true. False re-reads everything the shell has produced."}},
+          (), run_bash_output),
+    _tool("shell", "kill_shell",
+          "Stop a background shell and everything it started. Use it when a job is no longer needed -- a dev server you started will otherwise keep running.",
+          {"shell_id": {**STR, "description": "The id from bash(run_in_background=true)"}},
+          ["shell_id"], run_kill_shell),
 
     _tool("files", "read_file",
           "Read a text file. Relative paths resolve against the primary working directory. For a file too big to return at once, page through it with offset/limit.",
@@ -1418,6 +1469,15 @@ def agent_system_prompt(ctx: AgentContext) -> str:
                 "web_fetch reaches the public internet only; private and loopback "
                 "addresses are refused. Say so rather than trying to work around it."
             )
+
+    if ctx.allows("shell"):
+        lines.append(
+            "A command that will take more than a few seconds -- a build, a test suite, a "
+            "package upgrade -- or one that never exits, like a server, should be started "
+            "with bash(run_in_background=true) rather than a long timeout. That returns an "
+            "id straight away; collect output with bash_output as it goes, and kill_shell "
+            "when you no longer need it. Don't leave a server running once you're done with it."
+        )
 
     if ctx.allows("ssh"):
         names = ", ".join(h["name"] for h in ssh_tools.HOSTS)

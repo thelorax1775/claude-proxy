@@ -10,6 +10,7 @@ in order; on rate limit (429) or error, the next one in the list is tried.
 
 import asyncio
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -27,11 +28,21 @@ import approvals
 import github_api
 import integrations
 import sessions
+import background
 import ssh_tools
 import usage
 import web_tools
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    """Take backgrounded commands down with the proxy. Without this a restart
+    leaves orphaned builds and dev servers running with nothing pointing at
+    them -- and the next start finds the port already taken."""
+    yield
+    await background.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("claude-proxy")
 
