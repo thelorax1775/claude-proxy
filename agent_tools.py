@@ -83,7 +83,17 @@ def clamp_rounds(requested) -> int:
 SEARCH_TIMEOUT = AGENT_TOOL_TIMEOUT
 SEARCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_search.py")
 
-GROUPS = ["tasks", "shell", "files", "files_write", "git", "github", "github_write", "web", "ssh"]
+GROUPS = ["tasks", "agents", "shell", "files", "files_write", "git", "github", "github_write", "web", "ssh"]
+
+# How deep the spawn tree may go. 1 means the main run can start children and
+# they cannot start their own -- the useful case is "go and find out about
+# this" one level down, and each level past that multiplies the cost of a
+# request while making it harder to say what is actually happening.
+MAX_AGENT_DEPTH = int(os.getenv("AGENT_MAX_DEPTH", "1"))
+
+# Children per run. A model that wants a dozen has misunderstood the tool, and
+# each one is a full model conversation being paid for.
+MAX_SPAWNS = int(os.getenv("AGENT_MAX_SPAWNS", "4"))
 # Everything except the three groups that do something you can't take back:
 # post to other people's repositories, delete files, and act on a machine this
 # proxy's sandbox has no authority over.
@@ -205,6 +215,15 @@ class AgentContext:
         # Images read this round, waiting to be attached as a user message --
         # a tool result is text and cannot carry one.
         self.pending_images: list[dict] = []
+        # How deep in the spawn tree this run is, and how many children it has
+        # already started. Both are budgets, and both are checked before a
+        # child exists rather than after.
+        self.depth = 0
+        self.spawns_used = 0
+        # Set by the agent loop to the thing that can actually run a nested
+        # agent. None outside that loop, which is why spawn_agent reports being
+        # unavailable rather than failing oddly.
+        self.spawn = None
 
     @property
     def cwd(self) -> str:
@@ -364,6 +383,52 @@ async def run_kill_shell(ctx, shell_id: str) -> str:
         known = ", ".join(s.id for s in background.listing()) or "none"
         return f"[error] no background shell called '{shell_id}'. Known: {known}."
     return await background.kill(shell)
+
+
+async def run_spawn_agent(ctx, task: str, groups=None, max_rounds=None) -> str:
+    """Run a nested agent on one self-contained task and return only its answer.
+
+    The point is context, not parallelism. A question like "which of these
+    forty files defines the retry policy" costs a dozen rounds of tool output
+    that are worthless once answered, and every one of them stays in the parent
+    conversation for the rest of the run. A child pays that cost in its own
+    context and hands back the sentence that mattered.
+
+    Which means the task has to be self-contained: the child sees the task text
+    and nothing else -- not the conversation, not what was already tried. A
+    vague brief produces a confident answer to a question nobody asked, and the
+    parent has no way to tell.
+    """
+    if ctx.spawn is None:
+        return ("[error] sub-agents aren't available here (this isn't an interactive "
+                "agent run). Do the work directly instead.")
+    if ctx.depth >= MAX_AGENT_DEPTH:
+        return (f"[error] you are already a sub-agent, and nesting stops at "
+                f"{MAX_AGENT_DEPTH} deep. Do this part of the work yourself.")
+    if ctx.spawns_used >= MAX_SPAWNS:
+        return (f"[error] this run has already started {MAX_SPAWNS} sub-agents, "
+                "which is the limit. Do the rest of the work directly.")
+    task = (task or "").strip()
+    if len(task) < 20:
+        return ("[error] the task needs to be a self-contained brief -- the sub-agent "
+                "sees only this text, not the conversation. Say what to find out or "
+                "do, where to look, and what to report back.")
+
+    # A child may never hold a permission the parent doesn't. Narrowing is the
+    # only direction available, and unknown names are dropped rather than
+    # trusted, exactly as they are for the parent.
+    inherited = [g for g in ctx.groups if g != "agents"]
+    if isinstance(groups, list):
+        asked = [g for g in groups if isinstance(g, str)]
+        chosen = [g for g in inherited if g in asked]
+        if not chosen:
+            return (f"[error] none of {asked} are groups you have. "
+                    f"You can give a sub-agent any of: {', '.join(inherited)}.")
+    else:
+        chosen = inherited
+
+    ctx.spawns_used += 1
+    return await ctx.spawn(task=task, groups=chosen, max_rounds=max_rounds)
 
 
 async def run_notebook_edit(ctx, path: str, mode: str = "replace", cell: int = None,
@@ -1263,6 +1328,14 @@ TOOLS = [
           {"shell_id": {**STR, "description": "The id from bash(run_in_background=true)"}},
           ["shell_id"], run_kill_shell),
 
+    _tool("agents", "spawn_agent",
+          "Hand one self-contained task to a sub-agent and get back only its answer. Use it for work whose intermediate output you don't need -- searching a large codebase, checking a claim across many files, summarising a long document. The sub-agent sees ONLY the task text you write here: not this conversation, not what you have already tried. Write the brief accordingly, saying what to find out, where to look, and what to report. Don't use it for a single file read, or for anything where you need to see the steps.",
+          {"task": {**STR, "description": "The complete brief. Self-contained: state the goal, where to look, and exactly what to report back."},
+           "groups": {"type": "array", "items": STR,
+                      "description": "Tool groups to give it. Defaults to yours; can only narrow, never widen."},
+           "max_rounds": {**INT, "description": "Tool rounds it may use before it must answer"}},
+          ["task"], run_spawn_agent),
+
     _tool("files_write", "notebook_edit",
           "Change one cell of a Jupyter notebook, leaving every other cell's source, outputs and metadata intact. Use this rather than write_file for .ipynb files -- rewriting the whole file throws all of that away.",
           {"path": {**STR, "description": "The .ipynb file"},
@@ -1592,6 +1665,15 @@ def agent_system_prompt(ctx: AgentContext) -> str:
             "and completed only when the thing actually works rather than when you tried "
             "it. A step that failed stays open. Skip it entirely for single-step requests; "
             "a checklist for one thing is noise."
+        )
+
+    if ctx.allows("agents"):
+        lines.append(
+            "For a self-contained question whose working-out you don't need -- searching a "
+            "large tree, checking a claim across many files, reading a long document -- "
+            "hand it to spawn_agent and use the answer. It keeps a dozen rounds of tool "
+            "output out of this conversation. The sub-agent sees only the brief you write, "
+            "so say what to find, where, and what to report; it cannot ask you anything."
         )
 
     if ctx.allows("shell"):

@@ -1591,6 +1591,83 @@ APPROVAL_KEEPALIVE = 15
 SSE_KEEPALIVE = ":\n\n"
 
 
+async def run_subagent(client, chain, parent: agent_tools.AgentContext,
+                       task: str, groups: list[str], max_rounds: int) -> str:
+    """One nested agent run, start to finish, returning only its final text.
+
+    A cut-down agent_loop_gen: no streaming, no approvals, no history handed
+    back. That is the feature rather than a simplification -- the parent wants
+    the answer, and the twelve rounds of tool output it took to get there are
+    exactly what it is paying a child to keep out of its own context.
+
+    Errors come back as text rather than raised. A sub-agent that fails is a
+    tool call that failed, and the parent should be able to read why and carry
+    on, not have the whole run die with it.
+    """
+    child = agent_tools.build_agent_context(
+        parent.roots, parent.sandbox, groups, parent.lan,
+        # Never manual: there is no card in the UI for a nested run to park on,
+        # so asking for approval would hang the parent until the timeout.
+        approval="auto")
+    child.model = parent.model
+    child.depth = parent.depth + 1
+    # No child.spawn: MAX_AGENT_DEPTH decides whether nesting is allowed, but
+    # leaving this None means a deeper spawn fails as "unavailable" rather than
+    # silently recursing if that limit is ever raised.
+    if child.depth < agent_tools.MAX_AGENT_DEPTH:
+        child.spawn = lambda **kw: run_subagent(client, chain, child, **kw)
+
+    conv = [{"role": "system", "content": agent_tools.agent_system_prompt(child)},
+            {"role": "user", "content": task}]
+    tools = agent_tools.tools_for(child)
+    rounds = agent_tools.clamp_rounds(max_rounds)
+    answered = []
+
+    for _ in range(rounds):
+        data, _backend, _model, error, hard_status = await call_chain_non_stream(
+            client, chain, conv, tools=tools)
+        if data is None:
+            prefix = f"HTTP {hard_status}" if hard_status else "every backend failed"
+            return f"[error] the sub-agent couldn't run ({prefix}: {error})"
+
+        message = first_choice(data).get("message") or {}
+        text = message.get("content") or ""
+        tool_calls = [tc for tc in (message.get("tool_calls") or [])
+                      if isinstance(tc, dict) and (tc.get("function") or {}).get("name")]
+        if text:
+            answered.append(text)
+        if not tool_calls:
+            return "\n".join(answered).strip() or "(the sub-agent returned nothing)"
+
+        conv.append({"role": "assistant", "content": text or None,
+                     "tool_calls": tool_calls[:agent_tools.MAX_CALLS_PER_ROUND]})
+        for tc in tool_calls[:agent_tools.MAX_CALLS_PER_ROUND]:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"].get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            result = await agent_tools.execute_tool_call(child, name, args)
+            conv.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        # An image a child read is of no use to a parent that will never see
+        # the child's conversation, and sending it would cost the parent's
+        # budget for something it cannot act on.
+        child.pending_images = []
+
+    # Out of rounds. Ask once more with no tools so the work isn't wasted: what
+    # it found by round twelve is worth more to the parent than "it ran out".
+    conv.append({"role": "user", "content":
+                 "You are out of tool rounds. Report what you found and what is still "
+                 "unresolved, in plain text."})
+    data, _b, _m, error, _s = await call_chain_non_stream(client, chain, conv, tools=None)
+    if data is None:
+        return ("[error] the sub-agent ran out of rounds and couldn't summarise "
+                f"({error}). Partial findings:\n" + "\n".join(answered).strip())
+    final = (first_choice(data).get("message") or {}).get("content") or ""
+    return (f"[the sub-agent used all {rounds} rounds; this is where it got to]\n"
+            f"{final}").strip()
+
+
 async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentContext, max_rounds: int):
     """Agentic mode for the web UI only: lets the model call bash/file tools
     scoped to the session's working directories on this container, looping
@@ -1625,6 +1702,10 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     # cards by id, and approvals.create replaces an entry of the same name.
     seen_call_ids = set()
     async with upstream_client() as client:
+        # spawn_agent needs something that can actually run a model, which only
+        # exists in here. Bound to this client so a child's work is finished
+        # before the connection pool closes underneath it.
+        ctx.spawn = lambda **kw: run_subagent(client, chain, ctx, **kw)
         for _ in range(max_rounds):
             data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
                 client, chain, conv, tools=tools)
