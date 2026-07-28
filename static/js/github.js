@@ -7,6 +7,9 @@ import { store, emit } from "./store.js";
 
 let repos = [];
 let openRepo = "";
+// Why the stored token didn't check out, if it didn't. Kept next to the token
+// rather than in the general error line, because it's the status box's story.
+let tokenError = "";
 
 function connected() {
   return Boolean(store.integrations.github && store.integrations.github.configured);
@@ -21,12 +24,38 @@ function renderStatus() {
       model, and never shown back here.`;
     return;
   }
+  if (tokenError) {
+    // Say what's wrong here rather than leaving "checking…" on screen with an
+    // error stranded somewhere else.
+    box.className = "callout error";
+    box.innerHTML = `<strong>That token didn't work.</strong> ${escapeHtml(tokenError)}
+      <br>Paste a fresh one below, or <em>Disconnect</em> to clear it.`;
+    return;
+  }
+
   const who = store.githubUser;
-  box.className = "callout ok";
-  box.innerHTML = who
-    ? `<strong>Connected as ${escapeHtml(who.login)}.</strong> The agent's GitHub tools are
-       available; tick <em>GitHub write</em> in the Agent tab to let it open issues and PRs.`
-    : `<strong>Token saved.</strong> Checking who it belongs to…`;
+  if (!who) {
+    box.className = "callout ok";
+    box.innerHTML = `<strong>Token saved.</strong> Checking who it belongs to…`;
+    return;
+  }
+
+  // A classic token reports its scopes; a fine-grained one doesn't (it uses
+  // per-repository permissions instead), so an absent list means "not
+  // applicable" rather than "none". Showing the gap here beats discovering it
+  // when a clone of a private repo mysteriously 404s.
+  const scopes = who.scopes || [];
+  const missingRepo = who.scopes_reported && !scopes.includes("repo");
+  box.className = `callout ${missingRepo ? "warn" : "ok"}`;
+  const scopeLine = who.scopes_reported
+    ? `Scopes: <code>${scopes.length ? escapeHtml(scopes.join(", ")) : "none"}</code>.`
+    : `Fine-grained token — access is set per repository on GitHub.`;
+  box.innerHTML = `<strong>Connected as ${escapeHtml(who.login)}.</strong> ${scopeLine}
+    ${missingRepo
+      ? `<br>Without the <code>repo</code> scope this can only see public repositories —
+         cloning or reading a private one will fail.`
+      : `The agent's GitHub tools are available; tick <em>GitHub write</em> in the Agent tab
+         to let it open issues and PRs.`}`;
 }
 
 function renderRepos() {
@@ -144,17 +173,25 @@ export async function loadRepos() {
     renderRepos();
     return;
   }
-  try {
-    const [me, data] = await Promise.all([
-      api("/api/integrations/github/test", { method: "POST" }).catch(() => null),
-      api("/api/github/repos?limit=50"),
-    ]);
-    store.githubUser = me;
-    repos = data.repos;
-  } catch (err) {
-    $("github-error").textContent = err.message;
-    repos = [];
-  }
+  // Settled independently, not Promise.all: these answer two different
+  // questions, and one failing used to bury the other's answer. The repo list
+  // rejecting skipped the `store.githubUser = me` assignment entirely, so the
+  // status box sat on "Checking who it belongs to…" while an unrelated error
+  // printed underneath -- which reads exactly like the token check hanging.
+  const [who, list] = await Promise.allSettled([
+    api("/api/integrations/github/test", { method: "POST" }),
+    api("/api/github/repos?limit=50"),
+  ]);
+
+  store.githubUser = who.status === "fulfilled" ? who.value : null;
+  tokenError = who.status === "rejected" ? who.reason.message : "";
+
+  repos = list.status === "fulfilled" ? list.value.repos : [];
+  // Only worth saying separately when the token itself is fine; otherwise this
+  // is just an echo of the token error, which the status box already explains.
+  $("github-error").textContent =
+    list.status === "rejected" && !tokenError ? list.reason.message : "";
+
   renderStatus();
   renderRepos();
 }

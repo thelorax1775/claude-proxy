@@ -1142,7 +1142,15 @@ async def test_github():
         user = await github_api.whoami()
     except github_api.GitHubError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"login": user.get("login"), "name": user.get("name"), "url": user.get("html_url")}
+    return {
+        "login": user.get("login"),
+        "name": user.get("name"),
+        "url": user.get("html_url"),
+        # So a token that works but can't reach private repositories says so
+        # here, rather than at the moment a clone fails.
+        "scopes": user.get("scopes", []),
+        "scopes_reported": user.get("scopes_reported", False),
+    }
 
 
 # ---------------------------------------------------------------------------

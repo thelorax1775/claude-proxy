@@ -298,6 +298,7 @@ a.icon-btn { text-decoration: none; display: inline-block; }
 .callout strong { color: var(--text); }
 .callout.ok { border-left-color: var(--ok); }
 .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.callout.error { border-left-color: var(--danger); background: var(--danger-soft); }
 .callout code {
   font-family: var(--mono);
   font-size: 0.72rem;

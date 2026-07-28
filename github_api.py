@@ -14,6 +14,15 @@ import httpx
 import integrations
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+# Set by the test suite to an httpx.MockTransport, the same seam main.py uses
+# for backends. Patching httpx.AsyncClient globally instead would also capture
+# the tests' own ASGI client, which is a confusing way to find out.
+TRANSPORT = None
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=TIMEOUT, transport=TRANSPORT)
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
@@ -44,11 +53,40 @@ def scrub(text: str) -> str:
     return integrations.redact(text)
 
 
-async def request(method: str, path: str, *, params=None, json_body=None, accept: str | None = None):
+def token_shape_problem(token: str) -> str:
+    """Whether a token is unusable before GitHub is ever asked. Worth checking
+    separately because these all come back from GitHub as an indistinguishable
+    401, and "expired or revoked" sends you looking in the wrong place when the
+    real answer is that the paste picked up a stray character."""
+    if not token:
+        return "no token configured"
+    odd = sorted({c for c in token if ord(c) > 127})
+    if odd:
+        # An en-dash for a hyphen, or a zero-width space, is what a token
+        # pasted out of a document or a chat window looks like.
+        return (f"the token contains {len(odd)} non-ASCII character(s) "
+                f"({' '.join(repr(c) for c in odd[:3])}) -- it was probably copied from "
+                "somewhere that rewrote them. Copy it straight from GitHub.")
+    if any(c.isspace() for c in token):
+        return ("the token contains a space or line break -- copy it again without "
+                "the surrounding text")
+    if len(token) < 20:
+        return (f"the token is only {len(token)} characters, which is too short for a "
+                "GitHub token -- the copy was probably truncated")
+    return ""
+
+
+async def request(method: str, path: str, *, params=None, json_body=None, accept: str | None = None,
+                  want_headers: bool = False):
     token = require_token()
+    problem = token_shape_problem(token)
+    if problem:
+        raise GitHubError(problem)
+
     base = integrations.get("github_api")
     # Classic PATs (ghp_*) use "token" prefix; fine-grained PATs (github_pat_*)
-    # and GitHub App tokens use "Bearer".
+    # and GitHub App tokens use "Bearer". GitHub accepts either for most token
+    # types, so this is belt and braces rather than the thing that makes it work.
     prefix = "token" if token.startswith("ghp_") else "Bearer"
     headers = {
         "Authorization": f"{prefix} {token}",
@@ -58,15 +96,32 @@ async def request(method: str, path: str, *, params=None, json_body=None, accept
     }
     url = path if path.startswith("http") else f"{base}{path}"
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with _client() as client:
             resp = await client.request(method, url, headers=headers, params=params, json=json_body)
     except httpx.HTTPError as e:
         raise GitHubError(f"could not reach GitHub: {scrub(str(e))}") from e
+    except UnicodeEncodeError as e:
+        # Not an httpx.HTTPError, so this used to escape as a 500.
+        raise GitHubError(f"the token has a character that can't be sent in a header: {e}") from e
 
     if resp.status_code == 401:
-        raise GitHubError("GitHub rejected the token (401) -- it may be expired or missing scopes")
+        # A 401 is never a scope problem: /user needs no scopes at all, and an
+        # under-scoped token gets a 403. Saying "or missing scopes" here sent
+        # people to check scopes when the token itself was the thing wrong.
+        raise GitHubError(
+            f"GitHub rejected the token (401). The token itself is the problem -- expired, "
+            f"revoked, or not pasted in full. Scopes can't cause a 401. "
+            f"(sent {len(token)} characters, starting '{token[:4]}')")
     if resp.status_code == 403 and "rate limit" in resp.text.lower():
         raise GitHubError("GitHub rate limit hit -- wait a bit and retry")
+    if resp.status_code == 403:
+        # This is where scopes actually bite. Say which ones the token has, so
+        # the gap is visible rather than guessed at.
+        scopes = resp.headers.get("x-oauth-scopes")
+        have = f" The token's scopes are: {scopes or '(none)'}." if scopes is not None else ""
+        raise GitHubError(
+            f"GitHub refused that (403) -- the token is valid but not allowed to do it."
+            f"{have} A classic token needs the 'repo' scope for private repositories.")
     if resp.status_code == 404:
         raise GitHubError(f"not found (404): {path}")
     if resp.status_code >= 400:
@@ -78,11 +133,13 @@ async def request(method: str, path: str, *, params=None, json_body=None, accept
         raise GitHubError(f"GitHub returned {resp.status_code}: {scrub(detail)}")
 
     if accept and "json" not in accept:
-        return resp.text
-    try:
-        return resp.json()
-    except ValueError:
-        return resp.text
+        body = resp.text
+    else:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = resp.text
+    return (body, resp.headers) if want_headers else body
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +147,20 @@ async def request(method: str, path: str, *, params=None, json_body=None, accept
 # ---------------------------------------------------------------------------
 
 async def whoami() -> dict:
-    return await request("GET", "/user")
+    """Who the token belongs to, plus what it is allowed to do.
+
+    The scopes come back in a header, and reporting them is the difference
+    between finding out now that 'repo' is missing and finding out when a
+    clone of a private repository mysteriously 404s. Fine-grained tokens don't
+    send the header at all -- they use per-repository permissions instead --
+    so an absent value means "not applicable", not "none"."""
+    user, headers = await request("GET", "/user", want_headers=True)
+    scopes = headers.get("x-oauth-scopes")
+    if isinstance(user, dict):
+        user = dict(user)
+        user["scopes"] = [s.strip() for s in scopes.split(",") if s.strip()] if scopes else []
+        user["scopes_reported"] = scopes is not None
+    return user
 
 
 async def list_repos(limit: int = 30, query: str = "") -> list[dict]:
