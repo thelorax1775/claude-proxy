@@ -288,28 +288,63 @@ def test_needs_refresh_ignores_providers_it_cannot_read():
     assert usage.needs_refresh(ollama) is True     # gone stale
 
 
+def order_of(app):
+    return [b["name"] for b in
+            main.prioritise(list(app.BACKENDS), lambda b: b["name"])]
+
+
+def test_the_emptiest_account_is_tried_first(app):
+    """The point of the whole thing: a pool of accounts should drain evenly
+    rather than one being flattened while the rest sit idle."""
+    app.BACKENDS[:] = [backend(n) for n in ("a", "b", "c")]
+    remember("a", 80.0)
+    remember("b", 20.0)
+    remember("c", 50.0)
+    assert order_of(app) == ["b", "c", "a"]
+
+
+def test_close_figures_do_not_reshuffle_the_chain(app):
+    """Ordering on the raw percentage would change the leader every refresh --
+    the front of the chain is the end that gets used, so it would never settle.
+    Within a band the configured order stands."""
+    app.BACKENDS[:] = [backend("a"), backend("b")]
+    remember("a", 74.9)
+    remember("b", 74.1)          # emptier, but the same ten-point band
+    assert order_of(app) == ["a", "b"]
+
+    remember("b", 64.9)          # a band clear now
+    assert order_of(app) == ["b", "a"]
+
+
+def test_a_backend_we_cannot_measure_keeps_its_slot(app):
+    """A paid endpoint with no usage API, deliberately configured first, must
+    not be shuffled behind a pool of free accounts."""
+    app.BACKENDS[:] = [backend(n) for n in ("paid", "a", "b")]
+    remember("a", 80.0)
+    remember("b", 20.0)
+    assert order_of(app) == ["paid", "b", "a"]
+
+
 def test_spent_backends_go_to_the_back(app):
     app.BACKENDS[:] = [backend("a"), backend("b"), backend("c")]
     remember("a", 100.0)
-    order = [b["name"] for b in
-             main.demote_spent(list(app.BACKENDS), lambda b: b["name"])]
-    assert order == ["b", "c", "a"]
+    assert order_of(app) == ["b", "c", "a"]
 
 
-def test_demotion_keeps_the_configured_order_within_each_group(app):
+def test_spent_outranks_the_bands_even_with_nothing_to_compare(app):
+    """"Cannot answer at all" beats "fuller than that one", and has to hold
+    when the others have no figure to be compared against."""
     app.BACKENDS[:] = [backend(n) for n in ("a", "b", "c", "d")]
     remember("a", 100.0)
     remember("c", 100.0)
-    order = [b["name"] for b in
-             main.demote_spent(list(app.BACKENDS), lambda b: b["name"])]
-    assert order == ["b", "d", "a", "c"]
+    assert order_of(app) == ["b", "d", "a", "c"]
 
 
 def test_a_spent_backend_is_demoted_not_dropped(app):
     """Losing it entirely could turn a slow request into a failed one."""
     app.BACKENDS[:] = [backend("a"), backend("b")]
     remember("a", 100.0)
-    kept = main.demote_spent(list(app.BACKENDS), lambda b: b["name"])
+    kept = main.prioritise(list(app.BACKENDS), lambda b: b["name"])
     assert {b["name"] for b in kept} == {"a", "b"}
 
 
@@ -319,23 +354,28 @@ def test_all_spent_leaves_the_order_alone(app):
     app.BACKENDS[:] = [backend("a"), backend("b")]
     remember("a", 100.0)
     remember("b", 100.0)
-    order = [b["name"] for b in
-             main.demote_spent(list(app.BACKENDS), lambda b: b["name"])]
-    assert order == ["a", "b"]
+    assert order_of(app) == ["a", "b"]
 
 
-def test_demotion_can_be_switched_off(app, monkeypatch):
-    monkeypatch.setattr(main, "DEMOTE_SPENT", False)
+def test_stale_figures_fall_back_to_the_configured_order(app):
+    """Nothing is reordered on a guess."""
+    app.BACKENDS[:] = [backend("a"), backend("b")]
+    remember("a", 90.0, age=usage.ROUTING_MAX_AGE + 1)
+    remember("b", 10.0, age=usage.ROUTING_MAX_AGE + 1)
+    assert order_of(app) == ["a", "b"]
+
+
+def test_reordering_can_be_switched_off(app, monkeypatch):
+    monkeypatch.setattr(main, "REORDERS", False)
     app.BACKENDS[:] = [backend("a"), backend("b")]
     remember("a", 100.0)
-    order = [b["name"] for b in
-             main.demote_spent(list(app.BACKENDS), lambda b: b["name"])]
-    assert order == ["a", "b"]
+    remember("b", 10.0)
+    assert order_of(app) == ["a", "b"]
 
 
-def test_cooling_still_wins_over_demotion(app):
-    """A cooling backend leaves the chain outright; demotion only reorders
-    what is left."""
+def test_cooling_still_wins_over_ordering(app):
+    """A cooling backend leaves the chain outright; this only reorders what is
+    left."""
     app.BACKENDS[:] = [backend("a"), backend("b"), backend("c")]
     remember("b", 100.0)
     main.cool_down("a", 60)
@@ -347,11 +387,15 @@ def test_cooling_still_wins_over_demotion(app):
     assert order == ["c", "b"]
 
 
-async def test_status_reports_what_was_demoted(client, app):
-    app.BACKENDS[:] = [backend("a"), backend("b")]
+async def test_status_reports_the_effective_chain(client, app):
+    app.BACKENDS[:] = [backend("a"), backend("b"), backend("c")]
     remember("a", 100.0)
+    remember("b", 60.0)
+    remember("c", 10.0)
     body = (await client.get("/status")).json()
+    assert body["chain"] == ["c", "b", "a"]
     assert body["demoted"] == ["a"]
+    assert body["order"] == "least-used"
 
 
 async def test_the_endpoint_never_returns_a_key(client, monkeypatch):

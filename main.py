@@ -206,10 +206,24 @@ def note_failure(backend_name: str, status: int, resp=None) -> None:
         cool_down(backend_name, _retry_after(resp) or BACKEND_COOLDOWN)
 
 
-# Whether a backend whose weekly allowance is known to be gone should be tried
-# last instead of in its configured position. Set to 0 to keep the configured
-# order exactly as written.
-DEMOTE_SPENT = os.getenv("BACKEND_DEMOTE_SPENT", "1").strip().lower() not in ("0", "false", "no")
+# How the chain is ordered. "least-used" puts whichever backend has the most
+# allowance left at the front, so a pool of accounts drains evenly instead of
+# one at a time; "configured" uses backends.json exactly as written.
+BACKEND_ORDER = os.getenv("BACKEND_ORDER", "least-used").strip().lower()
+
+# The knob that shipped first, still honoured: 0 meant "never reorder", which
+# is what "configured" means now.
+if os.getenv("BACKEND_DEMOTE_SPENT", "1").strip().lower() in ("0", "false", "no"):
+    BACKEND_ORDER = "configured"
+
+REORDERS = BACKEND_ORDER != "configured"
+
+# Usage figures are rounded and move constantly, and the front of the chain is
+# the end that gets used -- so ordering on the raw percentage would have the
+# leader change every couple of minutes and the pool never settle. Ten-point
+# bands mean a backend only overtakes another once it is meaningfully emptier,
+# and accounts inside a band keep the order you wrote them in.
+USAGE_BAND = 10.0
 
 # Set while a background usage re-read is in flight, so a busy proxy starts one
 # refresh rather than one per request.
@@ -223,12 +237,12 @@ def warm_usage_cache() -> None:
     Routing reads the usage cache but must never wait on it, so something has
     to keep it warm. Doing it here means it is traffic that pays for it: a busy
     proxy re-checks every couple of minutes, an idle one never does, and there
-    is no timer to manage or shut down. Failure is silent -- this decides
-    whether a spent backend is tried first or last, and getting that wrong is
-    not worth a failed request.
+    is no timer to manage or shut down. Failure is silent -- this only decides
+    what order the chain is tried in, and getting that wrong is not worth a
+    failed request.
     """
     global _usage_refresh
-    if not DEMOTE_SPENT or not usage.needs_refresh(BACKENDS):
+    if not REORDERS or not usage.needs_refresh(BACKENDS):
         return
     if _usage_refresh is not None and not _usage_refresh.done():
         return
@@ -249,38 +263,65 @@ def warm_usage_cache() -> None:
     _usage_refresh = asyncio.create_task(run())
 
 
-def demote_spent(items, name_of):
-    """Backends whose allowance is known to be gone, moved to the back.
+def by_headroom(items, name_of):
+    """`items` with the emptiest accounts pulled toward the front.
+
+    Only backends we have a figure for move, and they move only between the
+    slots they already occupied: a backend whose usage can't be read -- a
+    provider with no usage API, or one that just failed to answer -- keeps its
+    index exactly. So a paid endpoint deliberately configured first stays
+    first instead of being shuffled behind a pool of free accounts, and a usage
+    API outage degrades to the configured order rather than to a guess.
+    """
+    slots = [i for i, item in enumerate(items)
+             if usage.cached_used_pct(name_of(item)) is not None]
+    if len(slots) < 2:
+        return items
+    # Stable, so backends in the same band keep their configured order.
+    ranked = sorted((items[i] for i in slots),
+                    key=lambda x: usage.cached_used_pct(name_of(x)) // USAGE_BAND)
+    out = list(items)
+    for slot, item in zip(slots, ranked):
+        out[slot] = item
+    return out
+
+
+def prioritise(items, name_of):
+    """`items` ordered by how much allowance each backend has left: emptiest
+    first, and anything known to be out of allowance last.
+
+    Spent backends go to the very back rather than into a band, because "this
+    one cannot answer at all" outranks "this one is fuller than that one", and
+    that has to hold even when nothing else has a figure to compare against.
 
     Deliberately a reorder and not a filter. A spent account still answers
     sometimes -- the figure is rounded, the window may have just rolled over,
-    and some providers keep serving at reduced priority -- so removing it could
-    turn a slow request into a failed one. Demoting costs nothing when the
+    and some providers keep serving at reduced priority -- so dropping it could
+    turn a slow request into a failed one. Reordering costs nothing when the
     others work and loses nothing when they don't.
-
-    Both groups keep their configured relative order, so this only ever moves
-    a backend past one that is actually more likely to answer.
     """
-    if not DEMOTE_SPENT or len(items) < 2:
+    if not REORDERS or len(items) < 2:
         return items
-    ready = [i for i in items if not usage.is_spent(name_of(i))]
-    if not ready or len(ready) == len(items):
-        return items          # nothing known to be spent, or all of them are
-    return ready + [i for i in items if usage.is_spent(name_of(i))]
+    spent = [i for i in items if usage.is_spent(name_of(i))]
+    head = [i for i in items if not usage.is_spent(name_of(i))]
+    if not head:
+        return items          # all equally bad; the configured order is the
+                              # better tiebreak than an arbitrary one
+    return by_headroom(head, name_of) + spent
 
 
 def usable_backends(items, name_of):
-    """`items` minus anything currently cooling down, with anything out of
-    quota moved to the back. If dropping the cooling ones would leave nothing,
-    every one of them is returned instead: an answer from an over-quota account
-    beats no answer at all, and the whole point of the chain is that it doesn't
+    """`items` minus anything currently cooling down, ordered by how much
+    allowance is left. If dropping the cooling ones would leave nothing, every
+    one of them is returned instead: an answer from an over-quota account beats
+    no answer at all, and the whole point of the chain is that it doesn't
     dead-end."""
     warm_usage_cache()
     usable = [i for i in items if not cooling_for(name_of(i))]
     if not usable and items:
         record_attempt("(chain)", "every backend cooling down -- trying anyway")
         usable = list(items)
-    return demote_spent(usable, name_of)
+    return prioritise(usable, name_of)
 
 
 # ---------------------------------------------------------------------------
@@ -892,14 +933,18 @@ async def status():
     which backends are currently benched and for how long, so a backend that
     has quietly dropped out of the chain is visible rather than mysterious.
 
-    `demoted` is the same idea for the other reason a backend isn't where you
-    put it: its allowance is spent, so it is tried last."""
+    `chain` answers the other question -- what order would the next request
+    actually try these in -- since with least-used ordering that is no longer
+    just backends.json read top to bottom. `demoted` is the tail of it: the
+    backends whose allowance is spent, so they are tried last."""
     return {
         "recent_attempts": list(ATTEMPT_LOG),
         "cooling": {b["name"]: cooling_for(b["name"]) for b in BACKENDS
                     if cooling_for(b["name"])},
+        "order": BACKEND_ORDER,
+        "chain": [b["name"] for b in prioritise(list(BACKENDS), lambda b: b["name"])],
         "demoted": [b["name"] for b in BACKENDS
-                    if DEMOTE_SPENT and usage.is_spent(b["name"])],
+                    if REORDERS and usage.is_spent(b["name"])],
     }
 
 

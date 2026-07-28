@@ -164,16 +164,31 @@ silently vanishes from the chain. The two durations are `BACKEND_COOLDOWN` and
 Cooling can never empty the chain: if every backend is benched they're all
 tried anyway. An answer from an over-quota account beats no answer.
 
-Where a provider will say how much allowance is left, a backend that has spent
-its weekly quota is **tried last** instead of in its configured position —
-otherwise a dead free-tier key costs every single request a 429 before the
-chain moves on. This is a reorder and not a filter: the account is still tried
-if everything above it fails, because a rounded figure and a window that may
-have just rolled over are not proof it will refuse. Backends keep their
-configured order within each group, so a demotion only ever moves one past a
-backend more likely to answer, and it never happens on a guess — an unknown or
-stale figure counts as no information. `/status` lists what's currently
-`demoted`, and `BACKEND_DEMOTE_SPENT=0` turns it off. See
+Where a provider will say how much allowance is left, the chain is **ordered by
+what's left rather than tried top to bottom**: whichever backend has the most
+of its weekly quota remaining goes first, and one that has spent its quota goes
+last. Without this a pool of accounts drains one at a time — the first is
+flattened while the rest sit idle, and once it's dead every single request pays
+a 429 before the chain moves on.
+
+Two things keep it from being disruptive:
+
+- **Ten-point bands.** The figures are rounded and move constantly, and the
+  front of the chain is the end that gets used, so ordering on the raw
+  percentage would change the leader every couple of minutes and never settle.
+  A backend only overtakes another once it's a band emptier; inside a band your
+  configured order stands.
+- **Only measured backends move.** A backend with no usage API — or one whose
+  usage lookup just failed — keeps its exact position, and the measured ones
+  are shuffled between the slots they already occupied. So a paid endpoint you
+  deliberately put first stays first, and a usage API outage falls back to the
+  configured order rather than to a guess.
+
+Demotion of a spent account is a reorder and not a filter: it's still tried if
+everything above it fails, because a rounded figure and a window that may have
+just rolled over are not proof it will refuse. `/status` reports the effective
+`chain`, what's currently `demoted`, and the `order` mode; `BACKEND_ORDER=configured`
+uses `backends.json` exactly as written. See
 [Remaining allowance](#remaining-allowance).
 
 ### Remaining allowance
@@ -779,7 +794,7 @@ You should see Anthropic-style SSE events (`message_start`,
 | `POST /v1/messages` | What Claude Code talks to (Anthropic → OpenAI translation) |
 | `POST /v1/messages/count_tokens` | Rough `len/4` estimate for context bookkeeping |
 | `GET /health` | Liveness plus the configured backend names |
-| `GET /status` | Last 50 backend attempts, newest last, plus what's cooling and what's demoted |
+| `GET /status` | Last 50 backend attempts, newest last, plus what's cooling, the effective chain order, and what's demoted |
 | `GET /api/usage` | Remaining allowance per backend; `?refresh=1` bypasses the cache |
 | `POST /api/approvals/{id}` | Answer a tool call a manual-mode run is parked on |
 | `POST /api/upload?name=&path=` | Raw-body file upload into a registered working directory |
