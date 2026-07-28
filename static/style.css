@@ -190,6 +190,9 @@ body {
 
 .section-head .hint { text-align: right; }
 
+/* Two words that must not become four lines when the head gets crowded. */
+.section-head .ghost-btn { white-space: nowrap; flex: none; }
+
 .stack { display: flex; flex-direction: column; gap: 0.5rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 

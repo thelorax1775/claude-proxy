@@ -96,6 +96,17 @@ export async function loadUsage({ refresh = false } = {}) {
   try {
     const data = await api(`/api/usage${refresh ? "?refresh=1" : ""}`);
     usageByName = Object.fromEntries((data.backends || []).map((u) => [u.name, u]));
+    // The cards are always in configured order, because that is what the up
+    // and down arrows edit. Once the router stops reading them top to bottom,
+    // the caption is the only thing that says so.
+    const hint = document.getElementById("order-hint");
+    if (hint && data.order) {
+      const leastUsed = data.order !== "configured";
+      hint.textContent = leastUsed ? "emptiest account tried first" : "tried in order";
+      hint.title = leastUsed
+        ? "Ordered by allowance left, in ten-point bands, with spent accounts last. Backends whose usage can't be read keep their position here."
+        : "Tried top to bottom, exactly as listed.";
+    }
     render();
   } catch {
     /* leave the cards as they are */

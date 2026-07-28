@@ -924,7 +924,11 @@ async def backend_usage(refresh: int = 0):
     """
     async with upstream_client() as client:
         rows = await usage.for_all(client, BACKENDS, force=bool(refresh))
-    return {"backends": rows, "ttl": usage.TTL_SECONDS}
+    # `order` rides along so the Backends tab can say what the list actually
+    # means without a second request: with least-used ordering the cards are no
+    # longer the order the chain is tried in, and a caption claiming otherwise
+    # is worse than none.
+    return {"backends": rows, "ttl": usage.TTL_SECONDS, "order": BACKEND_ORDER}
 
 
 @app.get("/status")
