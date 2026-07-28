@@ -501,11 +501,24 @@ Things worth knowing about individual tools:
 Lets agent mode reach machines *other* than the one running the proxy: run
 commands on them, and copy files each way.
 
-**The registry is the allowlist.** You add hosts in the Agent tab; the tools
-take a registered **name** and there is no way to hand them a connection
-string. So the set of machines the model can reach is exactly the set you
-typed in, and it cannot add to it. Hosts live in `ssh_hosts.json`
-(gitignored, written `chmod 600`).
+**The registry is the allowlist.** The tools take a registered **name** and
+there is no way to hand them a connection string, so the set of machines the
+model can reach is exactly the set in the registry. Hosts live in
+`ssh_hosts.json` (gitignored, written `chmod 600`).
+
+Add them in the Agent tab, or let the model add one with `ssh_add_host` when
+you give it the details in chat — "the NAS is at 10.0.0.5, log in as admin"
+is enough. **`ssh_add_host` has no password parameter**, and that's the point
+rather than an omission: a password typed into chat is in the prompt, in the
+stored conversation, and in every request sent upstream from then on — it has
+left the machine before it is ever used. A path is just a path, so a key can
+come from chat safely.
+
+So a host that needs a password is registered without one, and the tool tells
+the model to send you to the **key icon** on that host's card, where you type
+it into the browser. It goes straight to `ssh_hosts.json` without passing
+through a model, a prompt, or a transcript. The model is also told, in its
+system prompt, never to ask for one in chat.
 
 **Auth is a key or a password**, per host. Leave **Key file** blank to use the
 proxy user's default keys or agent, or give an absolute path to a specific one.
@@ -828,6 +841,7 @@ You should see Anthropic-style SSE events (`message_start`,
 | `POST /api/approvals/{id}` | Answer a tool call a manual-mode run is parked on |
 | `POST /api/upload?name=&path=` | Raw-body file upload into a registered working directory |
 | `GET/POST /api/ssh-hosts` | List and register SSH hosts |
+| `POST /api/ssh-hosts/{name}/password` | Set or clear one host's password; blank body clears |
 | `DELETE /api/ssh-hosts?name=` | Unregister one |
 | `POST /api/ssh-hosts/{name}/test` | Connect and run `true`; reports latency or the ssh error |
 | `GET /` | The web UI |

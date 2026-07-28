@@ -304,6 +304,27 @@ def register_host(name: str, host: str, user: str = "", port=22,
     return entry
 
 
+def set_password(name: str, password: str) -> dict | str:
+    """Set or clear one host's password, touching nothing else.
+
+    Separate from register_host because the caller here is a person answering
+    a prompt about an existing host, not something describing a whole entry.
+    Requiring the rest of the fields back would mean the UI had to hold a copy
+    of them, and a stale copy would quietly undo an edit made elsewhere.
+    """
+    entry = find_host(name)
+    if entry is None:
+        return f"[error] no SSH host called '{name}' is registered"
+    problem = validate_password(password)
+    if problem:
+        return problem
+    if password and not entry.get("user"):
+        return "[error] a username is required when using a password"
+    entry["password"] = password
+    save_hosts()
+    return entry
+
+
 def remove_host(name: str) -> bool:
     entry = find_host(name)
     if entry is None:

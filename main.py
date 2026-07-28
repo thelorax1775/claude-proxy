@@ -1173,6 +1173,23 @@ async def add_ssh_host(request: Request):
     return ssh_tools.public_host(result)
 
 
+@app.post("/api/ssh-hosts/{name}/password")
+async def set_ssh_password(name: str, request: Request):
+    """Set or clear one host's password.
+
+    Its own endpoint because this is the answer to a prompt about an existing
+    host, and because it is the path a password is supposed to take: typed in
+    the browser, written to ssh_hosts.json, never through a model. ssh_add_host
+    deliberately has no password parameter, so this is the other half of that.
+    """
+    body = await request.json()
+    result = ssh_tools.set_password(name, body.get("password") or "")
+    if isinstance(result, str):
+        code = 404 if "no SSH host" in result else 400
+        raise HTTPException(status_code=code, detail=result.removeprefix("[error] "))
+    return ssh_tools.public_host(result)
+
+
 @app.delete("/api/ssh-hosts")
 async def delete_ssh_host(name: str):
     if not ssh_tools.remove_host(name):

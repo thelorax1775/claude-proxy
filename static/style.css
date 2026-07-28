@@ -258,6 +258,14 @@ a.icon-btn { text-decoration: none; display: inline-block; }
   white-space: nowrap;
 }
 .card .actions { display: flex; gap: 0.1rem; flex-shrink: 0; }
+
+/* Folded away until asked for: a password field sitting open on every host
+   card invites typing one into a host that doesn't want one. */
+.password-form {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
 .card.is-selected { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .card.is-missing { border-style: dashed; }
 

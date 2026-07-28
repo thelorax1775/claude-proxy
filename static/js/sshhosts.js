@@ -26,6 +26,8 @@ function render() {
       <div class="row">
         <span class="title">${escapeHtml(h.name)}</span>
         <span class="actions">
+          <button class="icon-btn" data-act="password"
+                  title="${h.has_password ? "Change or remove the stored password" : "Store a password for this host"}">&#128273;</button>
           <button class="icon-btn" data-act="test" title="Connect and run a no-op">&#10003;</button>
           <button class="icon-btn danger" data-act="remove" title="Remove">&times;</button>
         </span>
@@ -39,15 +41,60 @@ function render() {
             ? `<span class="tag ${h.key_exists ? "" : "bad"}">${h.key_exists ? "key file" : "key file missing"}</span>`
             : `<span class="tag">default keys</span>`}
       </div>
+      <form class="form password-form is-hidden" data-password-form>
+        <label>Password for ${escapeHtml(h.user || "this host")}
+          <input type="password" data-password autocomplete="new-password"
+                 placeholder="${h.has_password ? "stored — type to replace" : "typed here, never in chat"}">
+        </label>
+        <span class="actions">
+          <button type="submit" class="primary-btn">Save</button>
+          ${h.has_password ? `<button type="button" class="ghost-btn" data-act="clear-password">Remove</button>` : ""}
+        </span>
+        <p class="hint">Stored in plain text in <code>ssh_hosts.json</code> (0600).
+          It never reaches the model or a chat message.</p>
+      </form>
       <p class="hint" data-test-result></p>
     </div>
   `).join("");
 
-  list.querySelectorAll("button[data-act]").forEach((btn) => {
-    const card = btn.closest(".card");
+  list.querySelectorAll(".card").forEach((card) => {
     const name = card.dataset.name;
-    btn.onclick = () => (btn.dataset.act === "remove" ? removeHost(name) : testHost(name, card));
+    const form = card.querySelector("[data-password-form]");
+
+    card.querySelectorAll("button[data-act]").forEach((btn) => {
+      btn.onclick = () => {
+        if (btn.dataset.act === "remove") return removeHost(name);
+        if (btn.dataset.act === "test") return testHost(name, card);
+        if (btn.dataset.act === "clear-password") return savePassword(name, "", card);
+        form.classList.toggle("is-hidden");
+        if (!form.classList.contains("is-hidden")) form.querySelector("[data-password]").focus();
+      };
+    });
+
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      savePassword(name, form.querySelector("[data-password]").value, card);
+    };
   });
+}
+
+// The password goes browser -> server -> ssh_hosts.json and stops there. It is
+// never put in the store, never re-rendered into a card, and the field is
+// cleared by the reload that follows.
+async function savePassword(name, password, card) {
+  const out = card.querySelector("[data-test-result]");
+  out.classList.remove("error");
+  out.textContent = password ? "Saving…" : "Removing…";
+  try {
+    await api(`/api/ssh-hosts/${encodeURIComponent(name)}/password`, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+    await loadSshHosts();
+  } catch (err) {
+    out.textContent = err.message;
+    out.classList.add("error");
+  }
 }
 
 async function testHost(name, card) {

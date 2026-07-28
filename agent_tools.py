@@ -975,13 +975,49 @@ def _ssh_host(name: str):
 
 async def run_ssh_list_hosts(ctx) -> str:
     if not ssh_tools.HOSTS:
-        return ("No SSH hosts are registered. They are added in the Agent tab of "
-                "the web UI; you cannot add one yourself.")
+        return ("No SSH hosts are registered. Use ssh_add_host if the user has "
+                "given you the connection details, or tell them to add one in "
+                "the Agent tab of the web UI.")
     lines = []
     for h in ssh_tools.HOSTS:
         key = "configured key" if h["key_path"] else "default keys/agent"
         label = f"  ({h['label']})" if h["label"] != h["name"] else ""
         lines.append(f"{h['name']}: {ssh_tools.describe(h)}  [{key}]{label}")
+    return "\n".join(lines)
+
+
+async def run_ssh_add_host(ctx, name: str, host: str, user: str = "",
+                           port=22, key_path: str = "", label: str = "") -> str:
+    """Register a machine so the other ssh tools can reach it.
+
+    There is no password parameter, and that is the whole design. A password
+    typed into chat is in the prompt, in the stored conversation, and in every
+    request sent upstream from then on -- it has left the machine before it is
+    ever used. A key path is a path, so it can come from chat safely; a
+    password has to be typed into the UI, which writes it straight to
+    ssh_hosts.json without it passing through a model at all.
+    """
+    entry = ssh_tools.register_host(
+        name=name, host=host, user=user, port=port,
+        key_path=key_path, label=label,
+        # None, not "": re-registering an existing name must not silently drop
+        # a password the user set in the UI.
+        password=None,
+    )
+    if isinstance(entry, str):
+        return entry
+    lines = [f"Registered '{entry['name']}' -> {ssh_tools.describe(entry)}."]
+    if entry["key_path"]:
+        if not os.path.isfile(entry["key_path"]):
+            lines.append(f"Note: no key file at {entry['key_path']} yet.")
+    elif not entry.get("password"):
+        lines.append(
+            "It has no key file and no password. If it needs a password, tell the "
+            "user to open the Agent tab and use 'Set password' on this host's "
+            "card -- you cannot set one and must not ask them for it here, "
+            "because anything typed in chat is sent upstream with every "
+            "following message.")
+    lines.append(f"Test it with ssh_run {entry['name']} 'true'.")
     return "\n".join(lines)
 
 
@@ -1244,6 +1280,15 @@ TOOLS = [
     _tool("ssh", "ssh_list_hosts",
           "List the SSH hosts this proxy is allowed to connect to. Commands run on a host by NAME from this list; there is no way to connect to anything else.",
           {}, (), run_ssh_list_hosts),
+    _tool("ssh", "ssh_add_host",
+          "Register a machine so the other ssh tools can reach it. Use this when the user gives you connection details in chat. Passwords are deliberately not accepted: if the host needs one, register it anyway and tell the user to set it with 'Set password' on the host's card in the Agent tab.",
+          {"name": {**STR, "description": "Short name the other ssh tools will use, e.g. 'nas'"},
+           "host": {**STR, "description": "Hostname or IP address"},
+           "user": {**STR, "description": "Username to log in as; required if it will use a password"},
+           "port": {**INT, "description": "Defaults to 22"},
+           "key_path": {**STR, "description": "Absolute path to a private key on this machine, if it has one"},
+           "label": {**STR, "description": "Optional human-readable description"}},
+          ["name", "host"], run_ssh_add_host),
     _tool("ssh", "ssh_run",
           "Run a shell command on a registered remote host and return its output. Non-interactive: a command that waits for input will time out rather than prompt.",
           {"host": {**STR, "description": "Registered host name, from ssh_list_hosts"},
@@ -1380,12 +1425,16 @@ def agent_system_prompt(ctx: AgentContext) -> str:
             # The group can be switched on before any host exists, so say what
             # to do about it rather than letting the model discover an empty
             # list mid-task and guess at a connection string.
-            names = ("none yet -- tell the user to add one in the Agent tab; "
-                     "do not try to reach a machine another way")
+            names = ("none yet -- use ssh_add_host if the user gives you the "
+                     "details, otherwise tell them to add one in the Agent tab")
         lines.append(
             f"You can also reach other machines over SSH. Registered hosts: {names}. "
             "Refer to a host by that name -- there is no way to connect to anything "
-            "not on the list, and you cannot add to it. "
+            "not on the list, though ssh_add_host can add to it. "
+            "Never ask for or accept an SSH password in chat: you cannot store one, "
+            "and anything typed here is sent upstream with every following message. "
+            "A host that needs a password is registered without one, and the user "
+            "sets it on the host's card in the Agent tab. "
             "Commands there run on a DIFFERENT machine: the working directories and "
             "the sandbox above say nothing about what you can touch on it, and there "
             "is no undo. Read before you change, and only run something destructive if "

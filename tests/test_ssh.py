@@ -5,6 +5,7 @@ refuses input that would change what ssh connects to, and that the arguments
 come out as separate argv elements rather than a string a shell could reopen.
 """
 
+import inspect
 import json
 import os
 import subprocess
@@ -292,6 +293,90 @@ async def test_a_blank_password_field_does_not_wipe_the_saved_one(client, hosts)
     assert hosts.find_host("nas")["password"] == "hunter2"
 
 
+# ---------------------------------------------------------------------------
+# ssh_add_host: the model may add a machine, but may never hold the password
+# for one. A password typed in chat is in the prompt, in the stored
+# conversation, and in every request sent upstream from then on.
+# ---------------------------------------------------------------------------
+
+def ssh_ctx():
+    return agent_tools.build_agent_context(
+        requested_paths=[], sandbox_requested=False, requested_groups=["ssh"])
+
+
+async def test_the_model_can_register_a_host(hosts):
+    out = await agent_tools.run_ssh_add_host(
+        ssh_ctx(), name="nas", host="10.0.0.5", user="admin", port=2222)
+    assert "Registered 'nas'" in out
+    assert hosts.find_host("nas")["host"] == "10.0.0.5"
+    assert hosts.find_host("nas")["port"] == 2222
+
+
+def test_ssh_add_host_has_no_password_parameter():
+    """The guarantee is structural, not a matter of the model behaving: there
+    is nowhere to put a password even if it tried."""
+    spec = next(t["spec"] for t in agent_tools.TOOLS if t["name"] == "ssh_add_host")
+    assert "password" not in spec["function"]["parameters"]["properties"]
+    assert "password" not in inspect.signature(agent_tools.run_ssh_add_host).parameters
+
+
+async def test_registering_a_keyless_host_says_who_sets_the_password(hosts):
+    """The model has to be told what to do next, or it will ask for the
+    password in chat -- which is the one thing this must not cause."""
+    out = await agent_tools.run_ssh_add_host(
+        ssh_ctx(), name="nas", host="10.0.0.5", user="admin")
+    assert "Set password" in out
+    assert "Agent tab" in out
+    assert "cannot set one" in out
+
+
+async def test_re_registering_does_not_drop_a_password_the_user_set(hosts):
+    """The model correcting a port must not silently undo the credential."""
+    hosts.register_host("nas", "10.0.0.5", user="admin", password="hunter2")
+    await agent_tools.run_ssh_add_host(
+        ssh_ctx(), name="nas", host="10.0.0.5", user="admin", port=2222)
+    assert hosts.find_host("nas")["password"] == "hunter2"
+    assert hosts.find_host("nas")["port"] == 2222
+
+
+async def test_the_model_still_cannot_read_a_password_back(hosts):
+    hosts.register_host("nas", "10.0.0.5", user="admin", password="hunter2")
+    assert "hunter2" not in await agent_tools.run_ssh_list_hosts(ssh_ctx())
+
+
+async def test_a_bad_host_is_refused_with_a_usable_message(hosts):
+    out = await agent_tools.run_ssh_add_host(ssh_ctx(), name="-oProxyCommand", host="e.com")
+    assert out.startswith("[error]")
+    assert hosts.HOSTS == []
+
+
+def test_set_password_touches_nothing_else(hosts):
+    hosts.register_host("nas", "10.0.0.5", user="admin", port=2222, label="the NAS")
+    hosts.set_password("nas", "hunter2")
+    entry = hosts.find_host("nas")
+    assert (entry["port"], entry["label"], entry["password"]) == (2222, "the NAS", "hunter2")
+
+
+def test_set_password_needs_a_known_host(hosts):
+    assert hosts.set_password("nope", "pw").startswith("[error]")
+
+
+async def test_the_password_endpoint_sets_and_clears(client, hosts):
+    hosts.register_host("nas", "10.0.0.5", user="admin")
+    r = await client.post("/api/ssh-hosts/nas/password", json={"password": "hunter2"})
+    assert r.status_code == 200
+    assert "hunter2" not in r.text          # the response describes, never echoes
+    assert hosts.find_host("nas")["password"] == "hunter2"
+
+    await client.post("/api/ssh-hosts/nas/password", json={"password": ""})
+    assert hosts.find_host("nas")["password"] == ""
+
+
+async def test_the_password_endpoint_404s_for_an_unknown_host(client, hosts):
+    r = await client.post("/api/ssh-hosts/nope/password", json={"password": "pw"})
+    assert r.status_code == 404
+
+
 async def test_clear_password_removes_it(client, hosts):
     await client.post("/api/ssh-hosts", json={
         "name": "nas", "host": "e.com", "user": "root", "password": "hunter2"})
@@ -530,7 +615,8 @@ async def test_settings_lists_every_group_with_no_availability_flag(client):
     assert [g["name"] for g in settings["groups"]] == agent_tools.GROUPS
 
     group = next(g for g in settings["groups"] if g["name"] == "ssh")
-    assert set(group["tools"]) == {"ssh_list_hosts", "ssh_run", "ssh_upload", "ssh_download"}
+    assert set(group["tools"]) == {"ssh_add_host", "ssh_list_hosts", "ssh_run",
+                                   "ssh_upload", "ssh_download"}
     assert settings["ssh_timeout"] and settings["ssh_max_timeout"]
 
     # Nothing is withheld from the UI, so there is no flag for it to read.
