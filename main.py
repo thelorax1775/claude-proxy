@@ -86,7 +86,23 @@ def save_backends():
         json.dump(BACKENDS, f, indent=2)
     os.replace(tmp, BACKENDS_PATH)
 
-HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+# How long to wait for a backend to answer. This is time-to-*completion* on a
+# non-streaming call, and it grows with the prompt: a 40k-token agent
+# conversation can take a free-tier model several minutes to get through, while
+# a one-line chat comes back in seconds. Too low and the chain burns one full
+# timeout per backend and calls it a connection error; too high and a genuinely
+# dead endpoint holds a request open.
+#
+# So agent runs get their own, larger budget. They are the ones with the long
+# prompts, and they are also the ones where failing over costs the most --
+# every backend in turn, at this many seconds each, with the conversation
+# growing the whole time.
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "120"))
+UPSTREAM_AGENT_TIMEOUT = float(os.getenv("UPSTREAM_AGENT_TIMEOUT", "300"))
+UPSTREAM_CONNECT_TIMEOUT = float(os.getenv("UPSTREAM_CONNECT_TIMEOUT", "10"))
+
+HTTP_TIMEOUT = httpx.Timeout(UPSTREAM_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT)
+AGENT_HTTP_TIMEOUT = httpx.Timeout(UPSTREAM_AGENT_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT)
 
 # Set by the test suite to an httpx.MockTransport so the whole failover and
 # translation stack can be exercised without a network. None in normal use,
@@ -1532,9 +1548,41 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
     hard_status is set (and error is the raw body) only for a non-retryable
     upstream error -- callers should pass that straight through rather than
     treat it as the whole chain being exhausted."""
+    result = None
+    async for kind, payload in call_chain_events(client, chain, messages, tools=tools):
+        if kind == "result":
+            result = payload
+    return result
+
+
+async def call_chain_events(client, chain, messages, tools=None):
+    """The failover chain, as a stream of what it is doing.
+
+    Yields ("attempt", {...}) each time a backend fails and the chain moves on,
+    then exactly one ("result", tuple) at the end. call_chain_non_stream wraps
+    this for callers that only want the answer.
+
+    It exists because failover used to be silent. A backend that times out
+    costs the full timeout before the next one is tried, so a chain of six is
+    minutes of a stream emitting nothing at all -- indistinguishable, from the
+    browser, from the proxy having died. The information was already being
+    recorded for /status; this puts it somewhere the person waiting can see it.
+    """
     last_error = None
     overflowed = False
+    attempted = 0
     for backend, model in usable_backends(chain, lambda pair: pair[0]["name"]):
+        attempted += 1
+        started = time.monotonic()
+
+        def moved_on(outcome):
+            """This backend didn't work. Same line /status already got, shaped
+            for the browser, with how long it cost -- because 'timed out' means
+            something quite different at 4 seconds and at 300."""
+            return ("attempt", {"backend": backend["name"], "model": model,
+                                "outcome": outcome, "attempt": attempted,
+                                "seconds": round(time.monotonic() - started, 1)})
+
         payload = {"model": model, "messages": messages, "stream": False}
         if tools:
             payload["tools"] = tools
@@ -1543,22 +1591,32 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
         try:
             resp = await client.post(url, headers=backend_headers(backend), json=payload)
         except httpx.HTTPError as e:
-            record_attempt(backend["name"], f"connection error: {e}")
+            # A timeout is the common one and reads as a bare "connection
+            # error" otherwise, which sends you looking at the network when the
+            # answer is that the prompt got too big for the budget.
+            outcome = (f"timed out after {round(time.monotonic() - started)}s"
+                       if isinstance(e, httpx.TimeoutException)
+                       else f"connection error: {e}")
+            record_attempt(backend["name"], outcome)
             cool_down(backend["name"], BACKEND_COOLDOWN)
-            last_error = str(e)
+            last_error = str(e) or outcome
+            yield moved_on(outcome)
             continue
         if resp.status_code in RETRYABLE_STATUS:
             note_failure(backend["name"], resp.status_code, resp)
             last_error = f"HTTP {resp.status_code}"
+            yield moved_on(f"HTTP {resp.status_code}")
             continue
         if resp.status_code >= 400:
             if is_context_overflow(resp.status_code, resp.text):
                 record_attempt(backend["name"], "context overflow")
                 overflowed = True
                 last_error = f"HTTP {resp.status_code}"
+                yield moved_on("context overflow")
                 continue
             record_attempt(backend["name"], f"HTTP {resp.status_code} (non-retryable)")
-            return None, None, None, resp.text, resp.status_code
+            yield ("result", (None, None, None, resp.text, resp.status_code))
+            return
         try:
             data = resp.json()
         except ValueError:
@@ -1566,15 +1624,18 @@ async def call_chain_non_stream(client: httpx.AsyncClient, chain, messages, tool
             # an unusable answer, not a reason to 500.
             record_attempt(backend["name"], "200 but the body was not JSON")
             last_error = f"{backend['name']} returned a non-JSON body"
+            yield moved_on("200 but the body was not JSON")
             continue
         record_attempt(backend["name"], "ok")
         clear_cooldown(backend["name"])
-        return data, backend["name"], model, None, None
+        yield ("result", (data, backend["name"], model, None, None))
+        return
     if overflowed:
         # OVERFLOW rather than a status, so the caller can tell the browser
         # what kind of failure this is and offer the one thing that fixes it.
-        return None, None, None, CONTEXT_OVERFLOW_MESSAGE, OVERFLOW
-    return None, None, None, last_error or "no backends configured", None
+        yield ("result", (None, None, None, CONTEXT_OVERFLOW_MESSAGE, OVERFLOW))
+        return
+    yield ("result", (None, None, None, last_error or "no backends configured", None))
 
 
 def sse_data(obj: dict) -> str:
@@ -1701,14 +1762,24 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
     # across the whole run, not just within a round: the browser keys its tool
     # cards by id, and approvals.create replaces an entry of the same name.
     seen_call_ids = set()
-    async with upstream_client() as client:
+    # The long budget: an agent conversation grows by a tool result every
+    # round, and the round that finally exceeds the default is the one where
+    # the chain starts spending a full timeout per backend.
+    async with upstream_client(AGENT_HTTP_TIMEOUT) as client:
         # spawn_agent needs something that can actually run a model, which only
         # exists in here. Bound to this client so a child's work is finished
         # before the connection pool closes underneath it.
         ctx.spawn = lambda **kw: run_subagent(client, chain, ctx, **kw)
         for _ in range(max_rounds):
-            data, used_backend, used_model, error, hard_status = await call_chain_non_stream(
-                client, chain, conv, tools=tools)
+            # Streamed rather than awaited, so a chain that spends a full
+            # timeout on each of six backends shows six lines of progress
+            # instead of going silent for ten minutes.
+            data = used_backend = used_model = error = hard_status = None
+            async for kind, payload in call_chain_events(client, chain, conv, tools=tools):
+                if kind == "attempt":
+                    yield sse_data({"agent_backend_attempt": payload})
+                else:
+                    data, used_backend, used_model, error, hard_status = payload
             if data is None:
                 # Whatever tool work already happened is still worth keeping --
                 # the next message shouldn't start over because one call failed.
@@ -2060,7 +2131,9 @@ async def messages(request: Request):
     claude_model = body.get("model", "")
 
     if body.get("stream"):
-        client = upstream_client()
+        # Claude Code drives tools too, so its conversations grow the same way
+        # an agent run's does and deserve the same budget.
+        client = upstream_client(AGENT_HTTP_TIMEOUT)
 
         async def gen():
             try:
@@ -2071,7 +2144,7 @@ async def messages(request: Request):
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    async with upstream_client() as client:
+    async with upstream_client(AGENT_HTTP_TIMEOUT) as client:
         nim_data, error_resp = await try_backends_non_stream(client, body)
         if error_resp is not None:
             return JSONResponse(status_code=error_resp.status_code, content={

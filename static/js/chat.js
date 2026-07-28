@@ -517,6 +517,15 @@ async function sendMessage({ resend = false } = {}) {
         continue;
       }
 
+      if (chunk.agent_backend_attempt) {
+        // Failover used to happen in silence. A chain of six backends each
+        // spending a full timeout is ten minutes of a stream emitting
+        // nothing, which is indistinguishable from the proxy having died.
+        const { backend, outcome, seconds } = chunk.agent_backend_attempt;
+        addNotice(`${backend}: ${outcome} after ${seconds}s — trying the next backend…`);
+        continue;
+      }
+
       if (chunk.agent_text) {
         agentTexts.push(chunk.agent_text);
         addMessage("assistant", chunk.agent_text);

@@ -115,6 +115,22 @@ silently vanishes from the chain. The two durations are `BACKEND_COOLDOWN` and
 Cooling can never empty the chain: if every backend is benched they're all
 tried anyway. An answer from an over-quota account beats no answer.
 
+**Failover is visible while it happens.** Each backend that fails posts a line
+into the chat — `ollama 6: timed out after 300s — trying the next backend…` —
+rather than the stream going quiet until something works. This matters most in
+the slowest case: a chain of six backends that each spend a full timeout is
+minutes of waiting, and without the running commentary that is indistinguishable
+from the proxy having died.
+
+**If you see repeated timeouts, the prompt has outgrown the budget.**
+`UPSTREAM_TIMEOUT` (default 120s) is the wait for a complete answer, and it
+scales with the conversation: a 40k-token agent run can take a free-tier model
+several minutes where a one-line chat takes seconds. Agent runs and Claude Code
+get `UPSTREAM_AGENT_TIMEOUT` (default 300s) instead, since they're the ones
+accumulating tool results. Raise either in `.env`. The connect timeout stays
+short (`UPSTREAM_CONNECT_TIMEOUT`, 10s) so a backend that isn't listening still
+fails fast.
+
 Where a provider will say how much allowance is left, the chain is **ordered by
 what's left rather than tried top to bottom**: whichever backend has the most
 of its weekly quota remaining goes first, and one that has spent its quota goes
