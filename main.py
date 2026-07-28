@@ -479,17 +479,81 @@ def sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+# ---------------------------------------------------------------------------
+# Token estimation.
+#
+# No tokenizer: this project's dependency list is four packages and stays that
+# way. Characters per token is crude but it only has to be good enough to
+# decide "is this near the window" and "how much do we drop", and it has to be
+# consistent everywhere -- one estimator, used by count_tokens, by the usage
+# Claude Code reads, and by the trimmer.
+#
+# It biases HIGH on purpose. Under-reporting is what walks a conversation into
+# an overflow; over-reporting only makes a client compact slightly early. The
+# function itself stays honest though -- no fudge factor lives in here, so the
+# safety margin can be tuned where it belongs, at the trim target.
+# ---------------------------------------------------------------------------
+
+CHARS_PER_TOKEN_TEXT = 4      # prose
+CHARS_PER_TOKEN_JSON = 3      # schemas and tool payloads tokenise denser
+# Per-message and per-tool framing the provider pays for and the content
+# itself doesn't show: role markers, delimiters, function-call scaffolding.
+MESSAGE_OVERHEAD_TOKENS = 4
+TOOL_OVERHEAD_TOKENS = 8
+
+
+def _value_tokens(value) -> int:
+    """Tokens for one content value, whatever shape it arrives in: a string, an
+    Anthropic block list, an OpenAI tool_calls list, a JSON schema.
+
+    Anything that isn't a plain string is measured serialised, because the
+    punctuation and keys are real tokens the provider is sent too. Being
+    shape-agnostic is the point: a block type this has never seen still
+    contributes its characters instead of vanishing from the count."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value) // CHARS_PER_TOKEN_TEXT
+    try:
+        return len(json.dumps(value, default=str)) // CHARS_PER_TOKEN_JSON
+    except (TypeError, ValueError):
+        return len(str(value)) // CHARS_PER_TOKEN_JSON
+
+
+def estimate_tokens(system=None, messages=None, tools=None) -> int:
+    """Rough input size of a request.
+
+    Counts the things that actually make an agentic turn big -- tool schemas,
+    tool_use inputs and tool_result payloads -- not just prose. Claude Code
+    sends ~15 tool schemas on every request; leaving them out is what made this
+    read a few hundred tokens for a 30k-token turn.
+
+    Takes Anthropic bodies (/v1/messages) and OpenAI ones (/api/chat) alike."""
+    total = _value_tokens(system if isinstance(system, str) else system_to_text(system))
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        total += MESSAGE_OVERHEAD_TOKENS
+        total += _value_tokens(msg.get("content"))
+        # OpenAI-shaped assistant turns carry their calls out of band; the
+        # Anthropic equivalent is a tool_use block already inside content.
+        total += _value_tokens(msg.get("tool_calls"))
+    for tool in tools or []:
+        total += TOOL_OVERHEAD_TOKENS + _value_tokens(tool)
+    return total
+
+
 def _output_tokens(upstream_usage, generated_chars: int) -> int:
     """What to report as output_tokens for a streamed response. Prefer the
-    provider's own count when it sent one; otherwise the same rough chars/4
-    estimate count_tokens uses. Claude Code spends this on context and cost
+    provider's own count when it sent one; otherwise the same rough estimate
+    used everywhere else. Claude Code spends this on context and cost
     accounting, so a number in the wrong unit is worse than an approximate
     one in the right unit."""
     if isinstance(upstream_usage, dict):
         reported = upstream_usage.get("completion_tokens")
         if isinstance(reported, int) and reported >= 0:
             return reported
-    return max(0, generated_chars // 4)
+    return max(0, generated_chars // CHARS_PER_TOKEN_TEXT)
 
 
 def backend_headers(backend: dict) -> dict:
@@ -567,13 +631,19 @@ async def stream_openai_as_anthropic(client: httpx.AsyncClient, body: dict, clau
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+    # Estimated rather than 0. Providers rarely report prompt_tokens on a
+    # stream, and a hardcoded zero told Claude Code every request was free --
+    # the same blind spot count_tokens had.
+    input_estimate = estimate_tokens(body.get("system"), body.get("messages"),
+                                     body.get("tools"))
+
     yield sse_event("message_start", {
         "type": "message_start",
         "message": {
             "id": msg_id, "type": "message", "role": "assistant",
             "content": [], "model": claude_model,
             "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": input_estimate, "output_tokens": 0},
         },
     })
 
@@ -1629,18 +1699,14 @@ async def ui_index():
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
+    """Claude Code asks this to decide when to compact. It used to count only
+    text blocks and ignore body["tools"] entirely, so an agentic turn -- ~15
+    tool schemas plus tool_result payloads -- reported a few hundred tokens for
+    a thirty-thousand-token request, and Claude Code walked straight into the
+    context window it was trying to stay inside."""
     body = await request.json()
-    text = system_to_text(body.get("system")) or ""
-    for msg in body.get("messages", []):
-        c = msg.get("content")
-        if isinstance(c, str):
-            text += c
-        else:
-            for block in c or []:
-                if block.get("type") == "text":
-                    text += block.get("text", "")
-    # Rough estimate only -- good enough for Claude Code's context accounting.
-    return {"input_tokens": max(1, len(text) // 4)}
+    return {"input_tokens": max(1, estimate_tokens(
+        body.get("system"), body.get("messages"), body.get("tools")))}
 
 
 async def try_backends_non_stream(client: httpx.AsyncClient, body: dict):

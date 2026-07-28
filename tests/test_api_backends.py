@@ -125,6 +125,9 @@ async def test_health_lists_the_backends(client):
 
 
 async def test_count_tokens_is_a_positive_estimate(client):
+    """A range, not an equality: this is an estimator, and pinning it to the
+    exact character ratio makes every future tuning look like a regression.
+    400 characters is ~100 tokens plus the per-message framing."""
     body = (await client.post("/v1/messages/count_tokens", json={
         "model": "m", "messages": [{"role": "user", "content": "x" * 400}]})).json()
-    assert body["input_tokens"] == 100
+    assert 100 <= body["input_tokens"] <= 130
