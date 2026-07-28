@@ -27,6 +27,7 @@ import git_tools
 import github_api
 import integrations
 import ssh_tools
+import tasklist
 import web_tools
 
 log = logging.getLogger("claude-proxy")
@@ -81,11 +82,11 @@ def clamp_rounds(requested) -> int:
 SEARCH_TIMEOUT = AGENT_TOOL_TIMEOUT
 SEARCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_search.py")
 
-GROUPS = ["shell", "files", "files_write", "git", "github", "github_write", "web", "ssh"]
+GROUPS = ["tasks", "shell", "files", "files_write", "git", "github", "github_write", "web", "ssh"]
 # Everything except the three groups that do something you can't take back:
 # post to other people's repositories, delete files, and act on a machine this
 # proxy's sandbox has no authority over.
-DEFAULT_GROUPS = ["shell", "files", "git", "github", "web"]
+DEFAULT_GROUPS = ["tasks", "shell", "files", "git", "github", "web"]
 
 # How tool calls are gated in agent mode:
 #   manual -- the run pauses before each call and waits for the browser
@@ -194,6 +195,9 @@ class AgentContext:
         self.groups = groups
         self.lan = lan
         self.approval = approval if approval in APPROVAL_MODES else "skip"
+        # Working state for this run only. It dies with the context, which is
+        # the point -- a checklist that outlives its reason is worse than none.
+        self.tasks = tasklist.TaskList()
 
     @property
     def cwd(self) -> str:
@@ -353,6 +357,13 @@ async def run_kill_shell(ctx, shell_id: str) -> str:
         known = ", ".join(s.id for s in background.listing()) or "none"
         return f"[error] no background shell called '{shell_id}'. Known: {known}."
     return await background.kill(shell)
+
+
+async def run_write_todos(ctx, tasks) -> str:
+    problem = ctx.tasks.replace(tasks)
+    if problem:
+        return problem
+    return ctx.tasks.render()
 
 
 async def run_read_file(ctx, path: str, offset: int = 0, limit: int = 0) -> str:
@@ -1142,6 +1153,18 @@ BOOL = {"type": "boolean"}
 OBJ = {"type": "object"}
 
 TOOLS = [
+    _tool("tasks", "write_todos",
+          "Record your plan for a multi-step request and keep it current. Send the WHOLE list every time -- it replaces what is stored. Mark a task in_progress before starting it and completed the moment it is genuinely done; only one may be in_progress at a time. Use it for anything with several distinct steps, and skip it for a single-step request.",
+          {"tasks": {"type": "array",
+                     "description": "The full list, in order",
+                     "items": {"type": "object",
+                               "properties": {
+                                   "content": {**STR, "description": "The step, as an imperative: 'add the parser'"},
+                                   "status": {**STR, "enum": list(tasklist.STATES),
+                                              "description": "pending, in_progress or completed"}},
+                               "required": ["content", "status"]}}},
+          ["tasks"], run_write_todos),
+
     _tool("shell", "bash",
           "Run a shell command. Runs in the session's primary working directory unless 'cwd' says otherwise. Output (stdout+stderr) is truncated if large.",
           {"command": {**STR, "description": "Shell command to run"},
@@ -1469,6 +1492,15 @@ def agent_system_prompt(ctx: AgentContext) -> str:
                 "web_fetch reaches the public internet only; private and loopback "
                 "addresses are refused. Say so rather than trying to work around it."
             )
+
+    if ctx.allows("tasks"):
+        lines.append(
+            "If the request has several distinct steps, call write_todos first with the "
+            "whole plan, then keep it current as you go -- one task in_progress at a time, "
+            "and completed only when the thing actually works rather than when you tried "
+            "it. A step that failed stays open. Skip it entirely for single-step requests; "
+            "a checklist for one thing is noise."
+        )
 
     if ctx.allows("shell"):
         lines.append(

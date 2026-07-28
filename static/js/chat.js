@@ -170,6 +170,31 @@ function addToolCall(name, args) {
   return card;
 }
 
+// The checklist is a single panel pinned above the composer, not a card in the
+// transcript. write_todos replaces its whole list on every call, so a
+// transcript entry per update would be eight near-identical lists, and the one
+// you want -- the current one -- would be the hardest to find.
+function renderTasks(items) {
+  const panel = $("agent-tasks");
+  if (!panel) return;
+  if (!items || !items.length) {
+    panel.classList.add("is-hidden");
+    panel.innerHTML = "";
+    return;
+  }
+  const done = items.filter((i) => i.status === "completed").length;
+  panel.classList.remove("is-hidden");
+  panel.innerHTML = `
+    <div class="task-head">Plan <span class="hint">${done}/${items.length} done</span></div>
+    <ul class="task-list">
+      ${items.map((i) => `
+        <li class="task ${escapeHtml(i.status)}">
+          <span class="task-mark" aria-hidden="true"></span>
+          <span class="task-text">${escapeHtml(i.content)}</span>
+        </li>`).join("")}
+    </ul>`;
+}
+
 function finishToolCall(card, output) {
   const failed = output.startsWith("[error]");
   card.className = `tool-call ${failed ? "failed" : "done"}`;
@@ -536,6 +561,13 @@ async function sendMessage({ resend = false } = {}) {
         continue;
       }
 
+      if (chunk.agent_tasks) {
+        // One panel that changes, rather than eight near-identical checklists
+        // down the transcript: write_todos replaces its whole list each call.
+        renderTasks(chunk.agent_tasks);
+        continue;
+      }
+
       if (chunk.agent_history) {
         agentHistory = chunk.agent_history;
         continue;
@@ -546,7 +578,17 @@ async function sendMessage({ resend = false } = {}) {
         continue;
       }
 
-      if (chunk.agent_done) continue;
+      if (chunk.agent_done) {
+        // The summary is the model's account of what it did; this is the
+        // list's. When they disagree, the list is the one that was written
+        // down before the work rather than after it.
+        if (chunk.unfinished && chunk.unfinished.length) {
+          addMessage("assistant",
+            `⚠ The run ended with ${chunk.unfinished.length} task(s) still open:\n` +
+            chunk.unfinished.map((t) => `• ${t}`).join("\n"));
+        }
+        continue;
+      }
 
       if (chunk.error) {
         if (chunk.error_kind === OVERFLOW) {

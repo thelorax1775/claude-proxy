@@ -259,6 +259,51 @@ a.icon-btn { text-decoration: none; display: inline-block; }
 }
 .card .actions { display: flex; gap: 0.1rem; flex-shrink: 0; }
 
+/* The run's checklist, pinned above the composer. Capped in height and
+   scrolling inside itself: a forty-item plan must not push the message box
+   off the screen, since that's the control you need to interrupt it. */
+.agent-tasks {
+  max-height: 9rem;
+  overflow-y: auto;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.task-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 0.35rem;
+}
+
+.task-list { list-style: none; margin: 0; padding: 0; }
+
+.task {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  padding: 0.1rem 0;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+/* The state is carried by a mark and by the text, never by colour alone. */
+.task-mark::before { content: "○"; color: var(--muted); }
+.task.in_progress .task-mark::before { content: "▸"; color: var(--accent); }
+.task.completed .task-mark::before { content: "✓"; color: var(--muted); }
+
+.task.completed .task-text { color: var(--muted); text-decoration: line-through; }
+.task.in_progress .task-text { font-weight: 600; }
+
 /* Folded away until asked for: a password field sitting open on every host
    card invites typing one into a host that doesn't want one. */
 .password-form {

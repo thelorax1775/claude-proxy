@@ -1655,7 +1655,12 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                 if text:
                     conv.append({"role": "assistant", "content": text})
                 yield sse_data({"agent_history": conv[base_len:]})
-                yield sse_data({"agent_done": True})
+                # A run that stops with items still open is the failure the
+                # checklist exists to catch -- a confident summary of three of
+                # the six things asked for. Report it rather than let the
+                # summary be the only account.
+                yield sse_data({"agent_done": True,
+                                "unfinished": ctx.tasks.unfinished()})
                 return
 
             if len(tool_calls) > agent_tools.MAX_CALLS_PER_ROUND:
@@ -1746,6 +1751,12 @@ async def agent_loop_gen(chain, messages, started_on, ctx: agent_tools.AgentCont
                     result = await agent_tools.execute_tool_call(ctx, name, args)
                 yield sse_data({"agent_tool_result": {"id": call_id, "name": name, "output": result}})
                 conv.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                # The checklist is the one tool result worth rendering as
+                # something other than text: it replaces itself every call, so
+                # a transcript of eight near-identical lists is worse than one
+                # panel that changes.
+                if name == "write_todos" and not result.startswith("[error]"):
+                    yield sse_data({"agent_tasks": ctx.tasks.public()})
                 # github_clone can add a working directory mid-run; tell the UI
                 # so its directory list and scope chip stay honest.
                 if name == "github_clone" and not result.startswith("[error]"):
