@@ -9,3 +9,9 @@ integrations.json
 ssh_hosts.json
 sessions/
 .pytest_cache/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
