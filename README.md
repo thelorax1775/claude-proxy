@@ -29,6 +29,17 @@ it.
 > reach. **Never bind it to a public interface.** See
 > [No auth, by design](#no-auth-by-design).
 
+> ### Project status: superseded, no longer developed
+>
+> Last change: July 2026. This repo is kept for reference. Its successor is
+> [jarvis-v1](https://github.com/thelorax1775/jarvis-v1), which reuses much of
+> the plumbing here (`ssh_tools.py`, `approvals.py`, `sessions.py`,
+> `tasklist.py`, `background.py`, `usage.py`) but takes a different approach:
+> it drives Claude Code headless as the agent and adds authentication, rather
+> than translating Claude Code's API calls to other providers. The
+> Anthropic-to-OpenAI translation and multi-backend failover described below
+> exist only here.
+
 ---
 
 ## Contents
